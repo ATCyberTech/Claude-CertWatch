@@ -171,6 +171,14 @@ def scan_storage_key(token: str) -> str:
     return f"scans/{token}/result.json"
 
 
+def report_storage_key(token: str) -> str:
+    """`scans/{token}/report.pdf` (Section 11's storage layout list) — the
+    PDF is persisted alongside `result.json` (M5); the CSV export is not
+    listed there and is generated fresh per request instead (see
+    `app.reports.report_builder.build_csv_report`)."""
+    return f"scans/{token}/report.pdf"
+
+
 def save_scan_record(storage: ObjectStorage, record: ScanRecord) -> None:
     storage.put(scan_storage_key(record.token), record.model_dump_json().encode("utf-8"))
 

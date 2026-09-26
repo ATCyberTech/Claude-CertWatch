@@ -315,3 +315,67 @@ def test_findings_one_scans_token_cannot_reach_another_scans_findings(client, mo
     assert (
         findings_a["findings"][0]["certificate_id"] != findings_b["findings"][0]["certificate_id"]
     )
+
+
+# --- GET /api/scans/{token}/report.pdf|csv (M5) ---
+
+
+def test_report_pdf_unknown_token_returns_404(client):
+    assert client.get("/api/scans/never-issued/report.pdf").status_code == 404
+
+
+def test_report_csv_unknown_token_returns_404(client):
+    assert client.get("/api/scans/never-issued/report.csv").status_code == 404
+
+
+def test_report_pdf_is_persisted_at_submission_and_downloadable(client, monkeypatch):
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    response = client.get(f"/api/scans/{token}/report.pdf")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.content.startswith(b"%PDF")
+    assert "certwatch-report.pdf" in response.headers["content-disposition"]
+
+
+def test_report_pdf_regenerates_on_the_fly_when_not_persisted(client, monkeypatch, tmp_path):
+    """Defensive fallback for a pre-M5 scan record with no stored PDF."""
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    storage = LocalFilesystemStorage(tmp_path)
+    storage.delete(routes_scans.report_storage_key(token))
+
+    response = client.get(f"/api/scans/{token}/report.pdf")
+    assert response.status_code == 200
+    assert response.content.startswith(b"%PDF")
+
+
+def test_report_csv_downloadable_and_matches_findings(client, monkeypatch):
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    response = client.get(f"/api/scans/{token}/report.csv")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "certwatch-report.csv" in response.headers["content-disposition"]
+    lines = response.text.strip().splitlines()
+    assert lines[0].startswith("certificate_id,subject_cn")
+    assert len(lines) == 2  # header + one certificate
+
+    findings = client.get(f"/api/scans/{token}/findings").json()["findings"]
+    assert findings[0]["certificate_id"] in lines[1]
+
+
+def test_report_csv_never_persisted_to_storage(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+    client.get(f"/api/scans/{token}/report.csv")
+
+    storage = LocalFilesystemStorage(tmp_path)
+    assert storage.get(f"scans/{token}/report.csv") is None

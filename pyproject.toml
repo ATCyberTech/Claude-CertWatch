@@ -86,6 +86,13 @@ disallow_untyped_defs = true
 module = ["asn1crypto.*"]
 ignore_missing_imports = true
 
+# weasyprint ships no type stubs / py.typed marker (M5 implementation note,
+# Decision Log) — used only in app.reports.report_builder for one call
+# (HTML(...).write_pdf()) whose return type is cast explicitly in that module.
+[[tool.mypy.overrides]]
+module = ["weasyprint.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

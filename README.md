@@ -5,15 +5,16 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M4 — deterministic risk engine implemented. `POST /api/scans`,
-`GET /api/scans/{token}`, and `GET /api/scans/{token}/findings` are real,
-working endpoints: submit a host list, get back a CSPRNG token, look up
-its scan's risk-severity summary, and page through its findings — one per
-unique certificate, with the risk engine's severity and flags computed
-per Section 9's fixed priority table. `report.pdf`/`.csv`, `ask`, and
-`ai-preference` still return HTTP 501 — each needs a later milestone
-(report generation, AI layer) to have anything to serve.** See
-[M4 — deterministic risk engine](#m4--deterministic-risk-engine) below.
+**Status: M5 — report generation implemented. `POST /api/scans`,
+`GET /api/scans/{token}`, `GET /api/scans/{token}/findings`,
+`GET /api/scans/{token}/report.pdf`, and `GET /api/scans/{token}/report.csv`
+are all real, working endpoints: submit a host list, get back a CSPRNG
+token, look up its scan's risk-severity summary, page through its
+findings, and download a risk-tiered PDF or CSV report — all built from
+the same `app.risk`-computed findings, so the exports and the API can
+never disagree. `ask` and `ai-preference` still return HTTP 501 — each
+needs a later milestone (AI layer, UI) to have anything to serve.** See
+[M5 — report generation](#m5--report-generation) below.
 
 ## What CertWatch is
 
@@ -53,8 +54,8 @@ app/
   risk/      — deterministic risk engine, no LLM involvement — DONE (M4)
   storage/   — object-storage abstraction + scan persistence — DONE (M3)
   ai/        — LLM tool-calling layer, AI on/off toggle — M7
-  reports/   — PDF/CSV report generation — M5
-  api/       — HTTP API routes (Section 13 route table) — submit/status/findings DONE (M3/M4), rest M5-M8
+  reports/   — PDF/CSV report generation — DONE (M5)
+  api/       — HTTP API routes (Section 13 route table) — submit/status/findings/report DONE (M3/M4/M5), rest M6-M8
   web/       — server-rendered UI — M6
 ```
 
@@ -98,6 +99,16 @@ compute the single-worst-flag `risk_severity` via a fixed priority table
 (never a weighted score) plus the full list of applicable flags. No LLM
 involvement anywhere in this module.
 
+`app/reports/report_builder.py` implements report generation (Section
+15): `render_report_html` renders one Jinja2 template (Section 1 —
+certificates requiring attention, Section 2 — full inventory, Section 3 —
+methodology/scope footer) from the same `app.risk`-grouped-and-scored
+`Certificate` list `GET /findings` serves, so the PDF, the CSV, and the
+API can never disagree with each other. `build_pdf_report` renders that
+HTML to PDF via WeasyPrint; `build_csv_report` writes the same data as
+CSV via the standard library's `csv` module. No LLM involvement — report
+generation never blocks on an AI call.
+
 ## Milestone sequence
 
 | Milestone | Deliverable |
@@ -107,12 +118,49 @@ involvement anywhere in this module.
 | **M2 gate** | Deployment target decided (local Windows dev, current) and the network-isolation mechanism documented for every supported target — resolved, see the Decision Log |
 | **M2** | TLS discovery + full SSRF/rebinding defense. `network_guard.py`, `tls_client.py`, `scanner.py`, full test suite passing |
 | **M3** | Object-storage persistence, token generation and lookup. `POST /api/scans` + `GET /api/scans/{token}` implemented end-to-end |
-| **M4** | Deterministic risk engine (five-category chain classification was M1). `GET /api/scans/{token}/findings` implemented end-to-end; `summary_counts` now severity-based (this README describes M0–M4) |
-| M5 | Report generation (PDF/CSV) |
+| **M4** | Deterministic risk engine (five-category chain classification was M1). `GET /api/scans/{token}/findings` implemented end-to-end; `summary_counts` now severity-based |
+| **M5** | Report generation (PDF/CSV). `GET /api/scans/{token}/report.pdf` and `.csv` implemented end-to-end (this README describes M0–M5) |
 | M6 | Minimal UI, including the AI on/off toggle |
 | M7 | AI analyst layer, grounding/citation checks, AI-disabled enforcement |
 | M8 | Rate limiting, secrets management, deletion endpoint, prompt-injection tests |
 | M9 | End-to-end testing + first real dry run |
+
+## M5 — report generation
+
+`app/reports/report_builder.py` implements Section 15 in full:
+
+- **`render_report_html(scan_record, certificates)`** — the single shared
+  HTML render both exports and (indirectly) `GET /findings` agree with:
+  Section 1 lists only certificates whose `risk_severity` isn't `"ok"`,
+  sorted worst-severity-first then soonest-expiring-first; Section 2 lists
+  every discovered certificate, `"ok"` ones included; Section 3 restates
+  Section 8's stated OCSP/CRL revocation-checking limitation and a
+  point-in-time disclaimer. No AI narration exists in this implementation
+  (there is no AI layer yet — M7) — Section 1's optional per-certificate
+  AI explanation is simply absent, not a placeholder.
+- **`build_pdf_report(scan_record, certificates)`** — renders that HTML to
+  PDF bytes via WeasyPrint.
+- **`build_csv_report(scan_record, certificates)`** — one CSV row per
+  certificate (matching Section 2's "every certificate, including
+  OK-status ones"), via the standard library's `csv` module — no pandas
+  dependency needed for something this simple.
+
+Both signatures extend the M0 stub (`list[Certificate]` only) to also
+take the owning `ScanRecord`, because the methodology footer needs
+scan-level metadata (`submitted_at`, `host_count`) a bare certificate list
+can't supply — recorded in the Decision Log, the same latitude M3 used
+for `resolve_and_validate`'s signature.
+
+**Persistence design (Decision Log):** Section 11's storage layout lists
+`scans/{token}/report.pdf` alongside `result.json` but no CSV key. So the
+PDF is rendered once, synchronously, at the end of `submit_scan` and
+persisted to that key — `report_url` in `ScanSubmitResponse` is meaningful
+the moment the scan itself completes. `GET /api/scans/{token}/report.pdf`
+normally just reads that persisted PDF back; it only regenerates on the
+fly as a defensive fallback, for a scan record persisted before this
+milestone existed (a dev-only scenario). The CSV export is never
+persisted and is always generated fresh per request from the persisted
+`ScanRecord`.
 
 ## M4 — deterministic risk engine
 
@@ -215,10 +263,10 @@ make run
 ```
 
 The app serves at `http://localhost:8000/`. `/healthz` returns a liveness
-check; `POST /api/scans`, `GET /api/scans/{token}`, and
-`GET /api/scans/{token}/findings` all work end-to-end. `report.pdf`/`.csv`,
-`ask`, and `ai-preference` still return HTTP 501 until their owning
-milestone lands.
+check; `POST /api/scans`, `GET /api/scans/{token}`,
+`GET /api/scans/{token}/findings`, and `GET /api/scans/{token}/report.pdf`
+/`.csv` all work end-to-end. `ask` and `ai-preference` still return HTTP
+501 until their owning milestone lands.
 
 No cloud account, API key, or network access beyond the actual scan
 targets is required to run or test CertWatch — the object-storage backend

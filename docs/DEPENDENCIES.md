@@ -21,7 +21,7 @@ of the inline justification comments already present in `pyproject.toml`.
 | `asn1crypto` | §8, Decision Log (M1) | `pyhanko-certvalidator`'s own certificate representation; `app.parsing` imports it directly to build `ValidationContext` trust roots from the certifi bundle, so it is pinned explicitly rather than relied on only as a transitive dependency |
 | `pyopenssl` | §6, §7, Decision Log (M2) | Retrieves the **full** server-presented certificate chain (leaf + intermediates) via OpenSSL's `SSL_get_peer_cert_chain()`. The stdlib `ssl` module has no public API for this in this Python version — `SSLSocket.getpeercert()` returns the leaf only — confirmed by direct introspection (`dir(ssl.SSLSocket)`) before choosing this dependency |
 | `slowapi` | §18 | Per-IP submission and `/ask` rate limiting without standing up a separate service |
-| `weasyprint` | §15 | Server-side HTML→PDF rendering for reports, no separate rendering service. Dependency is declared now; wiring is deferred to M5 |
+| `weasyprint` | §15 | Server-side HTML→PDF rendering for reports, no separate rendering service. Wired as of M5 (`app.reports.report_builder.build_pdf_report`) |
 
 **Deliberately not included:** any cloud SDK (`boto3`, `azure-storage-blob`,
 etc.), still, even after M3. The M2 gate resolved to local Windows dev as
@@ -35,7 +35,9 @@ token generation uses stdlib `secrets`, and persistence reuses `pydantic`
 (already a dependency) for the JSON-safe scan-record schema. No new
 runtime dependency was needed for M4 either — the risk engine is pure
 Python over data `cryptography`/`pydantic` (already dependencies) already
-produce.
+produce. No new runtime dependency was needed for M5 either — CSV export
+uses stdlib `csv`, not pandas, and `weasyprint`/`jinja2` were already
+declared dependencies, just not yet wired to anything.
 
 ## Dev / test dependencies
 
@@ -150,3 +152,24 @@ produce.
   response shape as M3's provisional `HostScanStatus` counts, different
   vocabulary: each host contributes to the severity bucket of the
   certificate it presented, or to a `scan_failed` bucket if it has none.
+- **`build_pdf_report`/`build_csv_report` now also take the owning
+  `ScanRecord`, beyond the M0 stub's bare `list[Certificate]`** (M5
+  implementation decision) — Section 3's methodology footer needs
+  scan-level metadata (`submitted_at`, `host_count`) a certificate list
+  alone can't supply; the same latitude M3 used for
+  `resolve_and_validate`'s signature change from its own M0 stub.
+- **The PDF is rendered once, synchronously, at the end of `submit_scan`
+  and persisted to `scans/{token}/report.pdf`; the CSV is never persisted
+  and is always regenerated per request** (M5 implementation decision) —
+  Section 11's storage layout explicitly lists a `report.pdf` key
+  alongside `result.json` but no CSV key, so this maps the stated storage
+  design directly rather than inventing a policy.
+- **`GET /api/scans/{token}/report.pdf` regenerates the PDF on the fly
+  only as a defensive fallback**, when no persisted PDF is found for a
+  token (M5 implementation decision) — a scenario that can only arise for
+  a scan record persisted before this milestone existed; there is no real
+  production data yet, so this is dev-only scaffolding, not a documented
+  production behavior.
+- **`mypy` overrides `weasyprint.*` with `ignore_missing_imports`** (M5
+  implementation note) — `weasyprint` ships no type stubs or `py.typed`
+  marker, same class of fix as the existing `asn1crypto.*` override.

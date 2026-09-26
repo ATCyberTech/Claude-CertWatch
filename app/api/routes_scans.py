@@ -1,9 +1,21 @@
 """Scan API routes — full Section 13 route table.
 
-`submit_scan`, `get_scan_status` (M3), and `get_scan_findings` (M4) are
-implemented. Every other handler remains a stub: each raises
-HTTPException(501) with a note on which milestone owns it — deliberate
-scaffolding, not a placeholder someone forgot to finish.
+`submit_scan`, `get_scan_status` (M3), `get_scan_findings` (M4), and
+`get_scan_report_pdf`/`get_scan_report_csv` (M5) are implemented. Every
+other handler remains a stub: each raises HTTPException(501) with a note
+on which milestone owns it — deliberate scaffolding, not a placeholder
+someone forgot to finish.
+
+Report generation note (M5 implementation decision, recorded in the
+Decision Log): the PDF is rendered once, synchronously, at the end of
+`submit_scan` and persisted to `scans/{token}/report.pdf` (Section 11's
+storage layout lists it there, alongside `result.json`) — `report_url` in
+`ScanSubmitResponse` is meaningful as soon as the scan itself completes,
+with no separate wait. `get_scan_report_pdf` regenerates on the fly, as a
+defensive fallback, only for a scan record persisted before this
+implementation existed (a dev-only scenario — there is no real production
+data yet). The CSV export is never persisted (Section 11 lists no CSV
+storage key) and is always generated fresh per request.
 
 Rate limiting (Section 13's "5 submissions/hour/IP", "20 questions/scan;
 60/hour/IP") is explicitly M8's job (Section 18) and is NOT implemented
@@ -28,11 +40,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, model_validator
 
 from app.core.config import Settings, get_settings
 from app.parsing.models import Certificate
+from app.reports.report_builder import build_csv_report, build_pdf_report
 from app.risk.risk_engine import (
     apply_risk_engine,
     evaluate_flags,
@@ -48,6 +61,7 @@ from app.storage.scan_store import (
     generate_scan_token,
     host_outcome_to_record,
     load_scan_record,
+    report_storage_key,
     save_scan_record,
 )
 
@@ -189,6 +203,10 @@ async def submit_scan(
     )
     save_scan_record(storage, record)
 
+    certificates = group_into_certificates(record)
+    apply_risk_engine(certificates)
+    storage.put(report_storage_key(token), build_pdf_report(record, certificates))
+
     report_url = str(request.url_for("get_scan_report_pdf", token=token))
     return ScanSubmitResponse(token=token, status=record.status, report_url=report_url)
 
@@ -272,15 +290,56 @@ async def get_scan_findings(
 
 
 @router.get("/{token}/report.pdf")
-def get_scan_report_pdf(token: str) -> None:
-    """Owned by M5 (report generation)."""
-    raise _not_implemented("M5")
+async def get_scan_report_pdf(
+    token: str, storage: ObjectStorage = Depends(get_object_storage)
+) -> Response:
+    """Section 13/15: `GET /api/scans/{token}/report.pdf`.
+
+    Normally just a storage read — the PDF was rendered once and persisted
+    at submission time (see the module docstring's M5 decision note). The
+    on-the-fly regeneration branch below is a defensive fallback only, for
+    a scan record persisted before this implementation existed.
+    """
+    record = load_scan_record(storage, token)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown scan token.")
+
+    pdf_bytes = storage.get(report_storage_key(token))
+    if pdf_bytes is None:
+        certificates = group_into_certificates(record)
+        apply_risk_engine(certificates)
+        pdf_bytes = build_pdf_report(record, certificates)
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="certwatch-report.pdf"'},
+    )
 
 
 @router.get("/{token}/report.csv")
-def get_scan_report_csv(token: str) -> None:
-    """Owned by M5 (report generation)."""
-    raise _not_implemented("M5")
+async def get_scan_report_csv(
+    token: str, storage: ObjectStorage = Depends(get_object_storage)
+) -> Response:
+    """Section 13/15: `GET /api/scans/{token}/report.csv`.
+
+    Always regenerated fresh from the persisted `ScanRecord` — Section 11's
+    storage layout lists no CSV key (see the module docstring's M5 decision
+    note), so there is nothing to read back here.
+    """
+    record = load_scan_record(storage, token)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown scan token.")
+
+    certificates = group_into_certificates(record)
+    apply_risk_engine(certificates)
+    csv_bytes = build_csv_report(record, certificates)
+
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="certwatch-report.csv"'},
+    )
 
 
 @router.post("/{token}/ask", response_model=AskResponse)
