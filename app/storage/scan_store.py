@@ -8,10 +8,12 @@ Scope note (M3 implementation decision, recorded in the Decision Log):
 this module persists RAW per-host scan outcomes (`HostResultRecord`, one
 per submitted host:port) rather than Section 10's endpoint-grouped-by-
 certificate shape (`Certificate.endpoints`, populated by grouping
-identical fingerprints across hosts). That grouping, together with
-`risk_severity` and `duplicate_of`, is M4's job once the risk engine
-exists to do it — M3 only needs a durable, lookup-able record of exactly
-what `app.scanning.scan_hosts` produced.
+identical fingerprints across hosts). This remains true after M4:
+`app.risk.risk_engine.group_into_certificates` does that grouping
+statelessly, on demand, from this raw persisted shape — it is never
+written back to storage. `risk_severity` is computed the same way, on
+demand, by the risk engine; `duplicate_of` is never populated at all (see
+`certificate_from_record` and the Decision Log for why).
 
 Scope note 2: a real S3-compatible cloud backend (Section 11) is
 deliberately NOT added yet. Local Windows dev remains the current active
@@ -29,7 +31,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
-from app.parsing.models import Certificate
+from app.parsing.models import Certificate, ChainCategory
 from app.scanning.scanner import HostScanOutcome
 from app.storage.interface import ObjectStorage
 
@@ -92,6 +94,38 @@ def certificate_to_record(certificate: Certificate) -> CertificateRecord:
         hostname_mismatch=certificate.hostname_mismatch,
         risk_severity=certificate.risk_severity,
         duplicate_of=certificate.duplicate_of,
+    )
+
+
+def certificate_from_record(record: CertificateRecord) -> Certificate:
+    """The reverse of `certificate_to_record` — owned by M4 (Section 9's
+    risk engine operates on `Certificate` dataclass instances, grouped by
+    fingerprint via `app.risk.risk_engine.group_into_certificates`, not on
+    the raw JSON-safe records this module persists).
+
+    `endpoints` is left at its default empty list here on purpose — the
+    caller (`group_into_certificates`) populates it by merging every
+    `HostResultRecord` that shares this fingerprint, which this function,
+    operating on a single record, has no visibility into.
+    """
+    return Certificate(
+        fingerprint_sha256=record.fingerprint_sha256,
+        subject_cn=record.subject_cn,
+        san_list=record.san_list,
+        issuer=record.issuer,
+        serial_number=record.serial_number,
+        not_before=record.not_before,
+        not_after=record.not_after,
+        key_algorithm=record.key_algorithm,
+        signature_algorithm=record.signature_algorithm,
+        pem=record.pem,
+        chain_category=ChainCategory(record.chain_category) if record.chain_category else None,
+        is_expired=record.is_expired,
+        days_to_expiry=record.days_to_expiry,
+        is_wildcard=record.is_wildcard,
+        hostname_mismatch=record.hostname_mismatch,
+        risk_severity=record.risk_severity,
+        duplicate_of=record.duplicate_of,
     )
 
 

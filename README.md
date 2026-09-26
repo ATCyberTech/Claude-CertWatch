@@ -5,14 +5,15 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M3 — object-storage persistence, token generation, and lookup
-implemented. `POST /api/scans` and `GET /api/scans/{token}` are real,
-working endpoints: submit a host list, get back a CSPRNG token, and look
-up its scan's status by that token alone. Every other `/api/scans` route
-(`findings`, `report.pdf`/`.csv`, `ask`, `ai-preference`) still returns
-HTTP 501 — each needs a later milestone (risk engine, report generation,
-AI layer) to have anything to serve.** See [M3 — persistence and the scan
-API](#m3--persistence-and-the-scan-api) below.
+**Status: M4 — deterministic risk engine implemented. `POST /api/scans`,
+`GET /api/scans/{token}`, and `GET /api/scans/{token}/findings` are real,
+working endpoints: submit a host list, get back a CSPRNG token, look up
+its scan's risk-severity summary, and page through its findings — one per
+unique certificate, with the risk engine's severity and flags computed
+per Section 9's fixed priority table. `report.pdf`/`.csv`, `ask`, and
+`ai-preference` still return HTTP 501 — each needs a later milestone
+(report generation, AI layer) to have anything to serve.** See
+[M4 — deterministic risk engine](#m4--deterministic-risk-engine) below.
 
 ## What CertWatch is
 
@@ -49,11 +50,11 @@ app/
   core/      — configuration (Settings), owned by M0
   scanning/  — DNS resolution, SSRF/rebinding guard, TLS discovery — DONE (M2)
   parsing/   — X.509 parsing, five-category chain classification — DONE (M1)
-  risk/      — deterministic risk engine, no LLM involvement — M4
+  risk/      — deterministic risk engine, no LLM involvement — DONE (M4)
   storage/   — object-storage abstraction + scan persistence — DONE (M3)
   ai/        — LLM tool-calling layer, AI on/off toggle — M7
   reports/   — PDF/CSV report generation — M5
-  api/       — HTTP API routes (Section 13 route table) — submit/status DONE (M3), rest M4-M8
+  api/       — HTTP API routes (Section 13 route table) — submit/status/findings DONE (M3/M4), rest M5-M8
   web/       — server-rendered UI — M6
 ```
 
@@ -89,6 +90,14 @@ guessable ID exists anywhere. `ScanRecord`/`HostResultRecord`/
 PostgreSQL. See the CertWatch MVP Technical Specification v1 for the full
 rationale (Sections 2, 11).
 
+`app/risk/risk_engine.py` implements the deterministic risk engine
+(Section 9): `group_into_certificates` builds Section 10's endpoint-
+grouped-by-certificate shape from a scan's raw persisted per-host results,
+on demand (never written back to storage); `classify_risk`/`evaluate_flags`
+compute the single-worst-flag `risk_severity` via a fixed priority table
+(never a weighted score) plus the full list of applicable flags. No LLM
+involvement anywhere in this module.
+
 ## Milestone sequence
 
 | Milestone | Deliverable |
@@ -97,13 +106,54 @@ rationale (Sections 2, 11).
 | **M1** | Certificate parser + fixture test suite. No live network dependency |
 | **M2 gate** | Deployment target decided (local Windows dev, current) and the network-isolation mechanism documented for every supported target — resolved, see the Decision Log |
 | **M2** | TLS discovery + full SSRF/rebinding defense. `network_guard.py`, `tls_client.py`, `scanner.py`, full test suite passing |
-| **M3** | Object-storage persistence, token generation and lookup. `POST /api/scans` + `GET /api/scans/{token}` implemented end-to-end (this README describes M0–M3) |
-| M4 | Deterministic risk engine, including the five-category chain classification |
+| **M3** | Object-storage persistence, token generation and lookup. `POST /api/scans` + `GET /api/scans/{token}` implemented end-to-end |
+| **M4** | Deterministic risk engine (five-category chain classification was M1). `GET /api/scans/{token}/findings` implemented end-to-end; `summary_counts` now severity-based (this README describes M0–M4) |
 | M5 | Report generation (PDF/CSV) |
 | M6 | Minimal UI, including the AI on/off toggle |
 | M7 | AI analyst layer, grounding/citation checks, AI-disabled enforcement |
 | M8 | Rate limiting, secrets management, deletion endpoint, prompt-injection tests |
 | M9 | End-to-end testing + first real dry run |
+
+## M4 — deterministic risk engine
+
+`app/risk/risk_engine.py` implements Section 9 in full:
+
+- **`expiry_tier`** — EXPIRED (days_to_expiry < 0), CRITICAL (≤7 days), HIGH
+  (≤30), MEDIUM (≤60), LOW (≤90), OK otherwise.
+- **`is_weak_crypto`** — RSA under 2048 bits, DSA (any size — the spec
+  gives it no threshold of its own), or ECDSA under P-256; or a signature
+  algorithm of MD5 or SHA1.
+- **`_is_shared`** — more than one endpoint observed the same certificate
+  fingerprint in the scan (the rule table's "Duplicate certificates" and
+  "Certificates shared across endpoints" rows are the same underlying
+  signal, "surfaced as shared, not an error").
+- **`classify_risk`** — the single worst applicable flag by Section 9's
+  fixed priority table: EXPIRED, then weak crypto or broken chain, then
+  hostname/SAN mismatch, then approaching-expiry tiers, then shared, then
+  private CA. Never a weighted numeric score.
+- **`_is_suspicious_configuration`** — a self-signed certificate alongside
+  other CA-issued certificates in the same scan (an inconsistent trust
+  posture). This is a supplementary flag surfaced via `evaluate_flags`,
+  not part of the `risk_severity` priority chain above — Section 9's own
+  priority sentence names only the six flags in `classify_risk`.
+
+`group_into_certificates` builds Section 10's endpoint-grouped-by-
+certificate shape from a scan's raw per-host results **on demand** — one
+`Certificate` per unique fingerprint, with every observing host:port
+merged into `.endpoints`. Nothing is written back to storage; M3's
+persisted shape is unchanged. `duplicate_of` is never populated (see the
+Decision Log) — merging same-fingerprint occurrences into one record
+already expresses "this certificate is shared/duplicated," so there is no
+second record left over needing a pointer back to a canonical one.
+
+`GET /api/scans/{token}/findings` serves this grouped, risk-scored view,
+paginated (`page`/`page_size`, default 50, capped at 200) and filterable
+by `severity` (Section 13 describes the request only as "filter, page"
+without naming the filter field — this implementation's choice, recorded
+in the Decision Log). `GET /api/scans/{token}`'s `summary_counts` now
+buckets by risk severity per host (superseding M3's raw `HostScanStatus`
+counts) — a host with no certificate at all (a failed handshake, a
+disallowed port) falls into a `scan_failed` bucket.
 
 ## M3 — persistence and the scan API
 
@@ -165,8 +215,9 @@ make run
 ```
 
 The app serves at `http://localhost:8000/`. `/healthz` returns a liveness
-check; `POST /api/scans` and `GET /api/scans/{token}` work end-to-end.
-Every other `/api/scans` sub-route still returns HTTP 501 until its owning
+check; `POST /api/scans`, `GET /api/scans/{token}`, and
+`GET /api/scans/{token}/findings` all work end-to-end. `report.pdf`/`.csv`,
+`ask`, and `ai-preference` still return HTTP 501 until their owning
 milestone lands.
 
 No cloud account, API key, or network access beyond the actual scan

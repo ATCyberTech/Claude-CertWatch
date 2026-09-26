@@ -1,19 +1,17 @@
-"""Deterministic risk engine — owned by M4.
+"""Deterministic risk engine — Section 9, implemented as of M4. No LLM
+involvement in this package, ever.
 
-NOT IMPLEMENTED YET. No LLM involvement in this package, ever (Section 9).
+See `app.risk.risk_engine` for the implementation:
+    - `expiry_tier` / `is_weak_crypto` — the individual per-certificate rules
+    - `group_into_certificates` — builds Section 10's endpoint-grouped-by-
+      certificate shape from a `ScanRecord`, on demand (not persisted)
+    - `classify_risk` / `evaluate_flags` — the fixed-priority-table overall
+      severity, plus the supplementary suspicious-configuration flag
+    - `summarize_risk_severity` — the per-host severity summary used by
+      `GET /api/scans/{token}`
 
-When implemented, this package computes, purely from app.parsing.models.Certificate
-fields already populated by M1:
-    - Expiry status tiers (EXPIRED / CRITICAL / HIGH / MEDIUM / LOW / OK)
-    - Weak/obsolete cryptography flags
-    - Duplicate-certificate and shared-across-endpoints detection
-    - The single suspicious-configuration rule (inconsistent trust posture
-      within one scan) — the wildcard-breadth inference is explicitly REMOVED
-      per the Decision Log and must not be reintroduced
-    - Overall risk_severity via the fixed priority table in Section 9 — a
-      priority table, never a weighted numeric score, to stay explainable
-      and testable
-
-Wildcard presence (Certificate.is_wildcard) is informational metadata only —
-this package must never use it to infer business necessity.
+Wildcard presence (`Certificate.is_wildcard`) is informational metadata
+only — this package never uses it to infer business necessity (the
+wildcard-breadth inference was explicitly removed per the Decision Log
+and must not be reintroduced).
 """

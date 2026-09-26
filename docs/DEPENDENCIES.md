@@ -32,7 +32,10 @@ one trivial once a specific cloud target is actually stood up (Decision
 Log). No `psycopg2`/ORM — PostgreSQL was superseded by the object-storage
 design (Decision Log). No new runtime dependency was needed for M3 —
 token generation uses stdlib `secrets`, and persistence reuses `pydantic`
-(already a dependency) for the JSON-safe scan-record schema.
+(already a dependency) for the JSON-safe scan-record schema. No new
+runtime dependency was needed for M4 either — the risk engine is pure
+Python over data `cryptography`/`pydantic` (already dependencies) already
+produce.
 
 ## Dev / test dependencies
 
@@ -110,3 +113,40 @@ token generation uses stdlib `secrets`, and persistence reuses `pydantic`
   object from the request body, breaking `POST /api/scans`'s own body
   parsing. Tests override the dependency via FastAPI's
   `app.dependency_overrides` instead of parameterizing the factory.
+- **`_key_algorithm` (M1's parser) now embeds EC curve bit-size and detects
+  DSA explicitly** (M4 fix to M1-owned code, found while implementing
+  Section 9's weak-crypto rule) — the rule needs bit-size comparisons
+  ("RSA under 2048 bits ... ECDSA under P-256") that a bare curve *name*
+  string (`EC-secp256r1`) can't supply without a name-to-bits lookup table,
+  and DSA previously fell through to a fragile, backend-specific
+  `Unknown (...)` class-name string. Format is now `EC-{curve}-{bits}`;
+  DSA is `DSA-{bits}`. No existing test asserted the old EC format, and no
+  test covered DSA at all, so this was a safe, additive change.
+- **DSA is flagged as weak crypto unconditionally, with no bit-size floor
+  of its own** (M4 implementation decision) — Section 9 gives RSA and EC
+  each an explicit bit-size threshold but names DSA with none, so any DSA
+  key size is treated as weak.
+- **`duplicate_of` is never populated** (M4 implementation decision) —
+  `group_into_certificates` merges every occurrence of a given fingerprint
+  into one `Certificate` record with an aggregated `endpoints[]`, so there
+  is no second, separate record left over that would need a pointer back
+  to a canonical one. The field stays on the dataclass for Section 10
+  schema compatibility but is unused by this implementation.
+- **`suspicious_configuration` is a supplementary flag, not part of the
+  `risk_severity` priority chain** (M4 implementation decision) — Section
+  9's own priority sentence for "Overall risk severity" names only six
+  flags (EXPIRED, weak crypto/broken chain, hostname mismatch,
+  approaching-expiry tiers, shared, private CA); suspicious configuration
+  is surfaced via `evaluate_flags`'s `flags` list but never wins
+  `classify_risk`'s single-worst-flag selection.
+- **`GET /api/scans/{token}/findings`'s `severity` filter and
+  `page`/`page_size` pagination** (M4 implementation clarification) —
+  Section 13 describes the request only as "filter, page" without naming
+  the filter field or a page size. `severity` matches a finding's computed
+  `risk_severity` (the only per-finding categorical value Section 9 itself
+  defines); `page_size` defaults to 50, capped at 200.
+- **`GET /api/scans/{token}`'s `summary_counts` is now risk-severity-based**
+  (M4 implementation decision, planned since M3) — same field name and
+  response shape as M3's provisional `HostScanStatus` counts, different
+  vocabulary: each host contributes to the severity bucket of the
+  certificate it presented, or to a `scan_failed` bucket if it has none.

@@ -29,7 +29,7 @@ import asn1crypto.x509 as asn1_x509
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, padding, rsa
 from cryptography.x509.oid import NameOID
 from pyhanko_certvalidator import CertificateValidator, ValidationContext
 
@@ -74,11 +74,23 @@ def _load_asn1_cert(der: bytes) -> asn1_x509.Certificate:
 
 
 def _key_algorithm(cert: x509.Certificate) -> str:
+    """Return the key-algorithm string stored on `Certificate.key_algorithm`.
+
+    The EC case embeds the curve's bit size (`EC-{name}-{bits}`) and DSA is
+    now detected explicitly — both additions made during M4 (not touched at
+    M1 time), because Section 9's weak-crypto rule ("RSA under 2048 bits,
+    DSA, or ECDSA under P-256") cannot be evaluated from a curve *name*
+    alone without a name-to-bits lookup table, and DSA previously fell
+    through to the `Unknown (...)` branch with a fragile, backend-specific
+    class name. Recorded in the Decision Log as an M4 fix to M1-owned code.
+    """
     public_key = cert.public_key()
     if isinstance(public_key, rsa.RSAPublicKey):
         return f"RSA-{public_key.key_size}"
+    if isinstance(public_key, dsa.DSAPublicKey):
+        return f"DSA-{public_key.key_size}"
     if isinstance(public_key, ec.EllipticCurvePublicKey):
-        return f"EC-{public_key.curve.name}"
+        return f"EC-{public_key.curve.name}-{public_key.curve.key_size}"
     if isinstance(public_key, ed25519.Ed25519PublicKey):
         return "Ed25519"
     if isinstance(public_key, ed448.Ed448PublicKey):

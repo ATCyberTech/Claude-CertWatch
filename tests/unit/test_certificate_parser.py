@@ -225,6 +225,41 @@ async def test_sha1_labeled_signature_parses_without_crashing(public_trust_roots
     assert cert.signature_algorithm == "sha1WithRSAEncryption"
 
 
+# --- key_algorithm string format for DSA / EC keys (M4, Section 9's weak-crypto rule) ---
+
+
+@pytest.mark.asyncio
+async def test_dsa_key_algorithm_is_detected_explicitly(public_trust_roots):
+    cert = await parse_certificate_chain(
+        [load_pem("leaf_dsa_key.pem"), load_pem("intermediate_public.pem")],
+        "dsa.example.com",
+        trust_roots=public_trust_roots,
+    )
+    assert cert.key_algorithm == "DSA-1024"
+
+
+@pytest.mark.asyncio
+async def test_ec_key_algorithm_embeds_curve_bit_size():
+    cert = await parse_certificate_chain(
+        [load_pem("leaf_ec_weak_curve.pem")],
+        "ecweak.example.com",
+        trust_roots=[],
+    )
+    assert cert.key_algorithm == "EC-secp224r1-224"
+    assert cert.chain_category is ChainCategory.SELF_SIGNED
+
+
+@pytest.mark.asyncio
+async def test_ec_p256_key_algorithm_embeds_curve_bit_size():
+    cert = await parse_certificate_chain(
+        [load_pem("leaf_ec_strong_curve.pem")],
+        "ecstrong.example.com",
+        trust_roots=[],
+    )
+    assert cert.key_algorithm == "EC-secp256r1-256"
+    assert cert.chain_category is ChainCategory.SELF_SIGNED
+
+
 # --- Parser robustness (T9) ---
 
 

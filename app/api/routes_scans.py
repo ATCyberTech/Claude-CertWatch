@@ -1,10 +1,9 @@
 """Scan API routes — full Section 13 route table.
 
-`submit_scan` and `get_scan_status` are implemented as of M3 (object-
-storage persistence, token generation and lookup — Section 11/12). Every
-other handler remains a stub: each raises HTTPException(501) with a note
-on which milestone owns it — deliberate scaffolding, not a placeholder
-someone forgot to finish.
+`submit_scan`, `get_scan_status` (M3), and `get_scan_findings` (M4) are
+implemented. Every other handler remains a stub: each raises
+HTTPException(501) with a note on which milestone owns it — deliberate
+scaffolding, not a placeholder someone forgot to finish.
 
 Rate limiting (Section 13's "5 submissions/hour/IP", "20 questions/scan;
 60/hour/IP") is explicitly M8's job (Section 18) and is NOT implemented
@@ -16,16 +15,31 @@ port override" without stating its shape. This implementation treats it
 as index-aligned with `hosts` (`ports[i]` applies to `hosts[i]`) when
 provided, and defaults every host to port 443 when omitted — the most
 common TLS port and consistent with Section 19's own worked examples.
+
+Findings pagination/filter note (M4 implementation clarification, recorded
+in the Decision Log): Section 13 lists the `/findings` request as just
+"filter, page" without naming the filter field(s) or a page size. This
+implementation filters on `severity` (matching a finding's computed
+`risk_severity` — the only per-finding categorical value Section 9 itself
+defines) and paginates with `page`/`page_size` (default 50, capped at 200).
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 from app.core.config import Settings, get_settings
+from app.parsing.models import Certificate
+from app.risk.risk_engine import (
+    apply_risk_engine,
+    evaluate_flags,
+    group_into_certificates,
+    severity_sort_key,
+    summarize_risk_severity,
+)
 from app.scanning.scanner import scan_hosts
 from app.storage import get_object_storage
 from app.storage.interface import ObjectStorage
@@ -35,7 +49,6 @@ from app.storage.scan_store import (
     host_outcome_to_record,
     load_scan_record,
     save_scan_record,
-    summarize_host_statuses,
 )
 
 router = APIRouter(prefix="/api/scans", tags=["scans"])
@@ -82,6 +95,37 @@ class ScanSubmitResponse(BaseModel):
 class ScanStatusResponse(BaseModel):
     status: str
     summary_counts: dict[str, int]
+
+
+class FindingEndpointResponse(BaseModel):
+    host: str
+    port: int
+    environment: str | None = None
+    owner: str | None = None
+
+
+class FindingResponse(BaseModel):
+    """Section 13/17's finding shape — the same fields the AI layer's
+    `get_findings(filter)` tool will be scoped to (M7): `{certificate_id,
+    subject_cn, san_list, issuer, days_to_expiry, risk_severity,
+    chain_category, endpoints, flags}`."""
+
+    certificate_id: str
+    subject_cn: str
+    san_list: list[str]
+    issuer: str
+    days_to_expiry: int | None
+    risk_severity: str
+    chain_category: str | None
+    endpoints: list[FindingEndpointResponse]
+    flags: list[str]
+
+
+class FindingsPageResponse(BaseModel):
+    findings: list[FindingResponse]
+    page: int
+    page_size: int
+    total: int
 
 
 class AskRequest(BaseModel):
@@ -156,23 +200,75 @@ async def get_scan_status(
     """Section 13: `GET /api/scans/{token}`. Token is the sole access
     control (Section 12) — there is no other authorization check.
 
-    `summary_counts` here is `HostScanStatus` counts (M3-scoped), not the
-    risk-severity tiers Section 9's deterministic risk engine will
-    eventually produce — see `app.storage.scan_store`'s module docstring.
-    The response shape does not change when M4 lands.
+    `summary_counts` is a per-host risk-severity summary as of M4 (see
+    `app.risk.risk_engine.summarize_risk_severity`) — the same field name
+    and response shape as M3's provisional `HostScanStatus` counts, just a
+    different vocabulary populating it (Decision Log).
     """
     record = load_scan_record(storage, token)
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown scan token.")
-    return ScanStatusResponse(
-        status=record.status, summary_counts=summarize_host_statuses(record.host_results)
+    return ScanStatusResponse(status=record.status, summary_counts=summarize_risk_severity(record))
+
+
+_DEFAULT_FINDINGS_PAGE_SIZE = 50
+_MAX_FINDINGS_PAGE_SIZE = 200
+
+
+def _finding_from_certificate(
+    certificate: Certificate, all_certificates_in_scan: list[Certificate]
+) -> FindingResponse:
+    return FindingResponse(
+        certificate_id=certificate.fingerprint_sha256,
+        subject_cn=certificate.subject_cn,
+        san_list=certificate.san_list,
+        issuer=certificate.issuer,
+        days_to_expiry=certificate.days_to_expiry,
+        risk_severity=certificate.risk_severity or "ok",
+        chain_category=certificate.chain_category.value if certificate.chain_category else None,
+        endpoints=[
+            FindingEndpointResponse(
+                host=endpoint.host,
+                port=endpoint.port,
+                environment=endpoint.environment,
+                owner=endpoint.owner,
+            )
+            for endpoint in certificate.endpoints
+        ],
+        flags=evaluate_flags(certificate, all_certificates_in_scan),
     )
 
 
-@router.get("/{token}/findings")
-def get_scan_findings(token: str, filter: str | None = None, page: int = 1) -> None:
-    """Owned by M4 (risk engine output)."""
-    raise _not_implemented("M4")
+@router.get("/{token}/findings", response_model=FindingsPageResponse)
+async def get_scan_findings(
+    token: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(_DEFAULT_FINDINGS_PAGE_SIZE, ge=1, le=_MAX_FINDINGS_PAGE_SIZE),
+    severity: str | None = Query(
+        None, description="Filter to findings whose risk_severity matches exactly."
+    ),
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> FindingsPageResponse:
+    """Section 13: `GET /api/scans/{token}/findings` — "paginated findings",
+    now that M4's risk engine has something to serve (see the module
+    docstring for the filter/pagination shape this implementation chose).
+    """
+    record = load_scan_record(storage, token)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown scan token.")
+
+    certificates = group_into_certificates(record)
+    apply_risk_engine(certificates)
+    certificates.sort(key=lambda c: (severity_sort_key(c.risk_severity or "ok"), c.subject_cn))
+
+    findings = [_finding_from_certificate(c, certificates) for c in certificates]
+    if severity is not None:
+        findings = [f for f in findings if f.risk_severity == severity]
+
+    total = len(findings)
+    start = (page - 1) * page_size
+    page_items = findings[start : start + page_size]
+    return FindingsPageResponse(findings=page_items, page=page, page_size=page_size, total=total)
 
 
 @router.get("/{token}/report.pdf")

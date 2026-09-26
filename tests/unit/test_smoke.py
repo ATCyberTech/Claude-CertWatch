@@ -25,9 +25,10 @@ def test_index_page_renders(client: TestClient) -> None:
     assert "not yet implemented" in response.text
 
 
-def test_scan_findings_not_yet_implemented(client: TestClient) -> None:
-    """M4 (risk engine output) owns this route — `/api/scans` itself is
-    implemented as of M3; see tests/unit/test_routes_scans.py for that."""
-    response = client.get("/api/scans/some-token/findings")
+def test_scan_report_pdf_not_yet_implemented(client: TestClient) -> None:
+    """M5 (report generation) owns this route — `/api/scans` and
+    `/api/scans/{token}/findings` are implemented as of M3/M4; see
+    tests/unit/test_routes_scans.py for those."""
+    response = client.get("/api/scans/some-token/report.pdf")
     assert response.status_code == 501
-    assert "M4" in response.json()["detail"]
+    assert "M5" in response.json()["detail"]

@@ -30,7 +30,7 @@ import asn1crypto.algos as algos
 import asn1crypto.x509 as asn1_x509
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
 from cryptography.x509.oid import NameOID
 
 FIXTURES_DIR = Path(__file__).parent
@@ -43,6 +43,14 @@ PAST_START = datetime.datetime(2019, 1, 1, tzinfo=datetime.UTC)
 
 def make_key(bits: int = 2048) -> rsa.RSAPrivateKey:
     return rsa.generate_private_key(public_exponent=65537, key_size=bits)
+
+
+def make_key_ec(curve: ec.EllipticCurve) -> ec.EllipticCurvePrivateKey:
+    return ec.generate_private_key(curve)
+
+
+def make_key_dsa(bits: int = 1024) -> dsa.DSAPrivateKey:
+    return dsa.generate_private_key(key_size=bits)
 
 
 def make_cert(
@@ -283,6 +291,47 @@ def main() -> None:
         sans=[x509.DNSName("weakkey.example.com")],
     )
     write_pem(leaf_weak_key, "leaf_weak_key.pem")
+
+    # Weak ECDSA curve (secp224r1, under P-256) — self-signed (subject ==
+    # issuer, so `_is_self_signed` classifies it via its ECDSA-verify
+    # branch), added for M4's weak-crypto rule (Section 9). Exercises
+    # `_key_algorithm`'s "EC-{curve}-{bits}" format end to end.
+    leaf_ec_weak_key = make_key_ec(ec.SECP224R1())
+    leaf_ec_weak = make_cert(
+        "ecweak.example.com",
+        "ecweak.example.com",
+        leaf_ec_weak_key.public_key(),
+        leaf_ec_weak_key,
+        sans=[x509.DNSName("ecweak.example.com")],
+    )
+    write_pem(leaf_ec_weak, "leaf_ec_weak_curve.pem")
+
+    # A non-weak ECDSA curve (secp256r1 / P-256 itself — the floor, not
+    # below it), for a negative test alongside the weak-curve fixture above.
+    leaf_ec_strong_key = make_key_ec(ec.SECP256R1())
+    leaf_ec_strong = make_cert(
+        "ecstrong.example.com",
+        "ecstrong.example.com",
+        leaf_ec_strong_key.public_key(),
+        leaf_ec_strong_key,
+        sans=[x509.DNSName("ecstrong.example.com")],
+    )
+    write_pem(leaf_ec_strong, "leaf_ec_strong_curve.pem")
+
+    # DSA key — added for M4's weak-crypto rule (Section 9), which flags
+    # DSA unconditionally regardless of key size. `_is_self_signed` has no
+    # DSA-verify branch, so this parses to chain_category BROKEN (no trust
+    # root presented either); only `key_algorithm` extraction is exercised
+    # here; chain outcome is incidental.
+    leaf_dsa_key_key = make_key_dsa(1024)
+    leaf_dsa = make_cert(
+        "dsa.example.com",
+        "CertWatch Test Public Intermediate",
+        leaf_dsa_key_key.public_key(),
+        intermediate_public_key,
+        sans=[x509.DNSName("dsa.example.com")],
+    )
+    write_pem(leaf_dsa, "leaf_dsa_key.pem")
 
     # SHA1-declared signature algorithm. This cryptography build's OpenSSL
     # backend refuses to actually SIGN with SHA1, so this fixture is built by
