@@ -129,9 +129,16 @@ async def test_resolution_failure_raises_resolution_error(monkeypatch):
 
 
 # --- Decimal/octal/hex-encoded private IPs (Section 5/6/22) ---
-# These go through the REAL resolver, unmocked: the OS canonicalizes these
-# forms to a dotted-quad before our code ever sees them, which is exactly
-# the mechanism being tested (see the module docstring).
+# These go through the REAL resolver, unmocked, on purpose: the defense
+# relies on whatever the OS resolver does with these non-canonical forms,
+# and that turns out to be platform-dependent (discovered by testing on
+# Windows, not assumed): glibc (Linux) canonicalizes them to a dotted-quad
+# before our code ever sees them; Windows' getaddrinfo (WinSock) refuses to
+# resolve them at all (WSANO_DATA / errno 11001), raising ResolutionError
+# instead. Both behaviors are safe — one canonicalizes into something
+# network_guard then correctly rejects, the other fails closed before an
+# address is even produced — so a test only fails here if the host is ever
+# treated as ALLOWED, never on which safe outcome a given platform picks.
 
 
 @pytest.mark.asyncio
@@ -145,14 +152,21 @@ async def test_resolution_failure_raises_resolution_error(monkeypatch):
     ],
 )
 async def test_encoded_private_ip_forms_are_rejected(encoded_host):
-    with pytest.raises(DisallowedAddressError):
+    with pytest.raises((DisallowedAddressError, ResolutionError)):
         await resolve_and_validate(encoded_host, 443)
 
 
 @pytest.mark.asyncio
 async def test_encoded_public_ip_form_is_not_rejected():
     # 134744072 == 8.8.8.8 in decimal — a public address, just written oddly.
-    target = await resolve_and_validate("134744072", 443)
+    # On a platform whose resolver refuses this numeric form outright
+    # (Windows), there's nothing to assert beyond "it wasn't rejected as a
+    # disallowed address" — the resolution failure itself is not a security
+    # problem, so it's skipped rather than failed.
+    try:
+        target = await resolve_and_validate("134744072", 443)
+    except ResolutionError:
+        pytest.skip("this platform's resolver does not accept this numeric hostname form")
     assert ipaddress.ip_address("8.8.8.8") in target.addresses
 
 
