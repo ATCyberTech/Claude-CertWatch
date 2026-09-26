@@ -30,6 +30,14 @@ dependencies = [
     # ValidationContext trust roots — never relied on only as a transitive dependency.
     "asn1crypto>=1.5.1",
 
+    # --- TLS scanning (Section 6, 7, Decision Log — M2) ---
+    # pyOpenSSL: retrieves the FULL server-presented certificate chain
+    # (leaf + intermediates) via OpenSSL's SSL_get_peer_cert_chain(). The
+    # stdlib `ssl` module has no public API for this in this Python
+    # version (SSLSocket.getpeercert() returns the leaf only) — confirmed
+    # by direct introspection before choosing this dependency.
+    "pyopenssl>=24.0",
+
     # --- Object storage abstraction (Section 11: no PostgreSQL at v0) ---
     # No cloud SDK (boto3 / azure-storage-blob / etc.) is pinned yet — cloud provider selection
     # is an explicit M2 gate (Decision Log). M0 ships only a local-filesystem backend behind the

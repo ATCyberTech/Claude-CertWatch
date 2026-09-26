@@ -5,10 +5,12 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M1 — certificate parsing and chain validation implemented,
-against local fixtures only. No live network scanning, storage, or AI
-logic is implemented yet.** See [M2 network scanning](#m2-network-scanning-is-not-yet-implemented)
-below.
+**Status: M2 — TLS discovery and SSRF/DNS-rebinding defense implemented.
+Certificate parsing (M1) and the scanning engine (M2) both work end-to-end
+against real hosts, but nothing is wired to the HTTP API yet: `/api/scans`
+still returns HTTP 501 because it needs M3's object-storage persistence to
+have anywhere to save a scan result/token.** See
+[M2 — network scanning](#m2--network-scanning) below.
 
 ## What CertWatch is
 
@@ -43,7 +45,7 @@ package without restructuring the project:
 ```
 app/
   core/      — configuration (Settings), owned by M0
-  scanning/  — DNS resolution, SSRF/rebinding guard, TLS discovery — M2
+  scanning/  — DNS resolution, SSRF/rebinding guard, TLS discovery — DONE (M2)
   parsing/   — X.509 parsing, five-category chain classification — DONE (M1)
   risk/      — deterministic risk engine, no LLM involvement — M4
   storage/   — object-storage abstraction (local backend at M0, cloud at M3)
@@ -59,7 +61,20 @@ using `cryptography` for field extraction and `pyhanko-certvalidator` for
 RFC 5280 PKIX path validation via a two-pass algorithm (public trust bundle,
 then trust extended to the server's own presented certificates). It runs
 entirely against local fixtures (`tests/fixtures/certs/`) — no live network
-dependency, and `app.scanning` (M2) does not need to exist yet for M1 to work.
+dependency, and can be exercised on its own without `app.scanning` existing.
+
+`app/scanning/` implements the live side (Section 5, 6, 7, 19):
+`network_guard.py` resolves a hostname exactly once and validates every
+returned address before any connection is attempted (blocks RFC1918/ULA,
+loopback, link-local including the cloud metadata address, multicast,
+unspecified, and IPv4-mapped-IPv6 forms of all of the above — this is the
+defense against SSRF and DNS-rebinding attacks); `tls_client.py` performs
+the TLS handshake against the validated IP literal (never re-resolving)
+using pyOpenSSL to retrieve the *full* server-presented certificate chain,
+which the stdlib `ssl` module cannot do in this Python version;
+`scanner.py` wires network_guard → tls_client → M1's certificate parser
+into a single non-raising per-host pipeline, under a two-level concurrency
+cap (global + per-scan) and a scan-wide safety-net timeout (Section 19).
 
 Persistence is one JSON document + one PDF per scan in object storage, keyed
 by a CSPRNG-generated token — not PostgreSQL. See the CertWatch MVP Technical
@@ -70,9 +85,9 @@ Specification v1 for the full rationale (Sections 2, 11).
 | Milestone | Deliverable |
 | --- | --- |
 | **M0** | Repository, architecture skeleton, hosting/CI setup — provider-independent |
-| **M1** | Certificate parser + fixture test suite. No live network dependency (this README describes M0+M1) |
-| **M2 gate** | Cloud provider selected and the network-isolation mechanism configured and verified, *before* any scanner code is written |
-| M2 | TLS discovery + full SSRF/rebinding design. Not complete until the SSRF/rebinding test suite passes |
+| **M1** | Certificate parser + fixture test suite. No live network dependency |
+| **M2 gate** | Deployment target decided (local Windows dev, current) and the network-isolation mechanism documented for every supported target — resolved, see the Decision Log |
+| **M2** | TLS discovery + full SSRF/rebinding defense. `network_guard.py`, `tls_client.py`, `scanner.py`, full test suite passing (this README describes M0–M2) |
 | M3 | Object-storage persistence, token generation and lookup |
 | M4 | Deterministic risk engine, including the five-category chain classification |
 | M5 | Report generation (PDF/CSV) |
@@ -81,15 +96,30 @@ Specification v1 for the full rationale (Sections 2, 11).
 | M8 | Rate limiting, secrets management, deletion endpoint, prompt-injection tests |
 | M9 | End-to-end testing + first real dry run |
 
-## M2 network scanning is not yet implemented
+## M2 — network scanning
 
-`app/scanning/` contains only module-boundary stubs. No hostname is resolved,
-no DNS lookup happens, and no TCP/TLS connection is ever made by this codebase
-at M0. The `/api/scans` endpoint exists (see Section 13) but returns HTTP 501
-for every request. This is deliberate: the SSRF/DNS-rebinding defense-in-depth
-design (Section 5) is gated on selecting a cloud provider and configuring its
-network-isolation mechanism first — see the M2 gate above and the Decision
-Log for why.
+`app/scanning/` is fully implemented: hostname resolution, SSRF/DNS-rebinding
+defense, TLS handshake and full certificate-chain retrieval, and the
+concurrency/timeout-bounded scan pipeline. The `/api/scans` endpoint still
+returns HTTP 501 for every request — that's M3's job, since submitting a
+scan needs somewhere to persist its token and result, and object storage
+isn't wired up yet.
+
+**The M2 gate (deployment target + network-isolation mechanism) is
+resolved.** The current, active deployment target is a **local Windows
+development machine** — application-layer SSRF defense
+(`network_guard.py`) runs unconditionally regardless of target and is
+fully tested (`tests/unit/test_network_guard.py`), but the network-layer
+half of defense-in-depth (a dedicated subnet with no route to private
+address space, an explicit firewall/ACL deny rule for the cloud metadata
+address, provider-specific metadata-service hardening) has no equivalent
+on an unconfigured local machine. This is an accepted, explicitly-documented
+dev-only gap — **do not expose a local-dev instance of this scanner to the
+public internet.** See `docs/deployment/` for the full, provider-agnostic
+picture: the same codebase is documented and supported for **AWS, GCP,
+Azure, Oracle OCI, and self-hosted** deployment, each with its specific
+network-isolation mechanism, so switching the active target later is a
+deployment-configuration change, not a code change.
 
 ## How to run locally
 

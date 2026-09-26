@@ -19,6 +19,7 @@ of the inline justification comments already present in `pyproject.toml`.
 | `pyhanko-certvalidator` | §8, Decision Log | The actual chain-validation engine: RFC 5280 path building, handles cross-signed certs and alternate paths, supports the two-pass validation algorithm needed to distinguish private-CA chains from broken ones. Selected specifically because `cryptography` + `certifi` alone do not perform path building — using them alone would have been an overclaim, corrected during the Final Implementation Clarifications pass |
 | `certifi` | §8 | Maintained public trust-root bundle used as Pass 1's trust anchor |
 | `asn1crypto` | §8, Decision Log (M1) | `pyhanko-certvalidator`'s own certificate representation; `app.parsing` imports it directly to build `ValidationContext` trust roots from the certifi bundle, so it is pinned explicitly rather than relied on only as a transitive dependency |
+| `pyopenssl` | §6, §7, Decision Log (M2) | Retrieves the **full** server-presented certificate chain (leaf + intermediates) via OpenSSL's `SSL_get_peer_cert_chain()`. The stdlib `ssl` module has no public API for this in this Python version — `SSLSocket.getpeercert()` returns the leaf only — confirmed by direct introspection (`dir(ssl.SSLSocket)`) before choosing this dependency |
 | `slowapi` | §18 | Per-IP submission and `/ask` rate limiting without standing up a separate service |
 | `weasyprint` | §15 | Server-side HTML→PDF rendering for reports, no separate rendering service. Dependency is declared now; wiring is deferred to M5 |
 
@@ -51,3 +52,28 @@ object-storage design (Decision Log).
   Decision Log.
 - **`mypy` overrides `asn1crypto.*` with `ignore_missing_imports`** —
   `asn1crypto` ships no type stubs or `py.typed` marker.
+- **M2 gate resolved: local Windows machine is the current deployment
+  target; AWS, GCP, Azure, Oracle OCI, and self-hosted are all documented
+  and supported by the same provider-agnostic code** (M2 implementation
+  decision, user-directed). See `docs/deployment/` for each target's
+  network-isolation mechanism and the Decision Log for the full rationale.
+- **`SSL.VERIFY_NONE` at the TLS layer is an intentional design choice, not
+  an oversight** (M2 implementation decision) — CertWatch's own two-pass
+  validator (`app.parsing.certificate_parser`) is the sole source of truth
+  for chain trust; a strict OpenSSL verify would refuse to complete a
+  handshake at all for the private/internal-CA case CertWatch is
+  specifically designed to still report on.
+- **Global scan concurrency is a `functools.lru_cache(maxsize=1)`-backed
+  `asyncio.Semaphore` singleton** (M2 implementation decision) — this is
+  what makes the Section 19 concurrency cap hold across *simultaneous scan
+  submissions*, not just within one `scan_hosts` call; a fresh per-scan
+  semaphore is created on every call to additionally bound concurrency
+  within a single scan.
+- **pyOpenSSL handshakes require a manual `WantReadError`/`WantWriteError`
+  retry loop** (M2 implementation note, discovered while writing
+  `tests/unit/test_tls_client.py`) — a Python socket with `settimeout(x)`
+  set retries transparently at the socket-module level, but pyOpenSSL
+  talks to the fd directly via OpenSSL's BIO layer and bypasses that retry,
+  surfacing transient not-ready states as exceptions instead. Fixed with
+  `select.select`-driven retries bounded by the same per-host timeout
+  budget (`app/scanning/tls_client.py::_run_ssl_op`).
