@@ -67,6 +67,12 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+# FastAPI's Depends()/Query()/Path() defaults are the framework's own
+# idiom for dependency injection, not the mutable-default-argument bug
+# B008 exists to catch (M3 implementation note, Decision Log).
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

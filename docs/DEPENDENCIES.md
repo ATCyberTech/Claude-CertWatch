@@ -24,11 +24,15 @@ of the inline justification comments already present in `pyproject.toml`.
 | `weasyprint` | §15 | Server-side HTML→PDF rendering for reports, no separate rendering service. Dependency is declared now; wiring is deferred to M5 |
 
 **Deliberately not included:** any cloud SDK (`boto3`, `azure-storage-blob`,
-etc.). Cloud provider selection is an explicit M2 gate recorded in the
-Decision Log — M0 ships only the `LocalFilesystemStorage` backend behind the
-`ObjectStorage` interface, so local development and CI need no cloud
-credentials at all. No `psycopg2`/ORM — PostgreSQL was superseded by the
-object-storage design (Decision Log).
+etc.), still, even after M3. The M2 gate resolved to local Windows dev as
+the current active deployment target — no cloud credentials exist to test
+a real S3-compatible backend against, so `LocalFilesystemStorage` remains
+the only `ObjectStorage` backend; the interface itself (M0) makes adding
+one trivial once a specific cloud target is actually stood up (Decision
+Log). No `psycopg2`/ORM — PostgreSQL was superseded by the object-storage
+design (Decision Log). No new runtime dependency was needed for M3 —
+token generation uses stdlib `secrets`, and persistence reuses `pydantic`
+(already a dependency) for the JSON-safe scan-record schema.
 
 ## Dev / test dependencies
 
@@ -77,3 +81,32 @@ object-storage design (Decision Log).
   surfacing transient not-ready states as exceptions instead. Fixed with
   `select.select`-driven retries bounded by the same per-host timeout
   budget (`app/scanning/tls_client.py::_run_ssl_op`).
+- **Encoded-private-IP tests accept either `DisallowedAddressError` or
+  `ResolutionError`** (M2 fix, found testing on Windows) — Linux's glibc
+  canonicalizes decimal/octal/hex-encoded IP forms before validation ever
+  sees them; Windows' WinSock `getaddrinfo` refuses to resolve them at all
+  (`WSANO_DATA`). Both are safe outcomes; the tests only fail if a host is
+  ever treated as allowed.
+- **M3 persists raw per-host scan outcomes, not Section 10's endpoint-
+  grouped-by-certificate shape** (M3 implementation decision) —
+  certificate deduplication (`duplicate_of`, grouping into
+  `Certificate.endpoints`) and `risk_severity` are M4's job once the risk
+  engine exists to do that grouping/scoring; M3 only needs a durable,
+  lookup-able record of exactly what `scan_hosts` produced.
+- **`ports` in `POST /api/scans` is index-aligned with `hosts`** (M3
+  implementation clarification) — Section 13 describes it only as
+  "optional per-host port override" without stating its shape; this
+  implementation requires `len(ports) == len(hosts)` when provided
+  (422 otherwise) and defaults every host to port 443 when omitted.
+- **Scans run synchronously inside the `POST /api/scans` request**, not
+  via a background job queue (M3 implementation decision) — Section 2's
+  own architecture table places "Background jobs" as "None customer-
+  facing" at v0, and Section 19's worst-case estimate (250 hosts, ~85
+  seconds) is explicitly sized for exactly this.
+- **`get_object_storage()` takes no parameters**, unlike an earlier draft
+  that took an optional `Settings` argument (M3 implementation note,
+  found while wiring the API routes) — a FastAPI dependency callable with
+  a `Settings`-typed parameter is itself treated as needing a `Settings`
+  object from the request body, breaking `POST /api/scans`'s own body
+  parsing. Tests override the dependency via FastAPI's
+  `app.dependency_overrides` instead of parameterizing the factory.

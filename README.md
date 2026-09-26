@@ -5,12 +5,14 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M2 — TLS discovery and SSRF/DNS-rebinding defense implemented.
-Certificate parsing (M1) and the scanning engine (M2) both work end-to-end
-against real hosts, but nothing is wired to the HTTP API yet: `/api/scans`
-still returns HTTP 501 because it needs M3's object-storage persistence to
-have anywhere to save a scan result/token.** See
-[M2 — network scanning](#m2--network-scanning) below.
+**Status: M3 — object-storage persistence, token generation, and lookup
+implemented. `POST /api/scans` and `GET /api/scans/{token}` are real,
+working endpoints: submit a host list, get back a CSPRNG token, and look
+up its scan's status by that token alone. Every other `/api/scans` route
+(`findings`, `report.pdf`/`.csv`, `ask`, `ai-preference`) still returns
+HTTP 501 — each needs a later milestone (risk engine, report generation,
+AI layer) to have anything to serve.** See [M3 — persistence and the scan
+API](#m3--persistence-and-the-scan-api) below.
 
 ## What CertWatch is
 
@@ -48,10 +50,10 @@ app/
   scanning/  — DNS resolution, SSRF/rebinding guard, TLS discovery — DONE (M2)
   parsing/   — X.509 parsing, five-category chain classification — DONE (M1)
   risk/      — deterministic risk engine, no LLM involvement — M4
-  storage/   — object-storage abstraction (local backend at M0, cloud at M3)
+  storage/   — object-storage abstraction + scan persistence — DONE (M3)
   ai/        — LLM tool-calling layer, AI on/off toggle — M7
   reports/   — PDF/CSV report generation — M5
-  api/       — HTTP API routes (Section 13 route table, stubbed at M0) — M2-M8
+  api/       — HTTP API routes (Section 13 route table) — submit/status DONE (M3), rest M4-M8
   web/       — server-rendered UI — M6
 ```
 
@@ -76,9 +78,16 @@ which the stdlib `ssl` module cannot do in this Python version;
 into a single non-raising per-host pipeline, under a two-level concurrency
 cap (global + per-scan) and a scan-wide safety-net timeout (Section 19).
 
-Persistence is one JSON document + one PDF per scan in object storage, keyed
-by a CSPRNG-generated token — not PostgreSQL. See the CertWatch MVP Technical
-Specification v1 for the full rationale (Sections 2, 11).
+`app/storage/scan_store.py` implements persistence (Section 10/11/12):
+`generate_scan_token()` produces a CSPRNG token (`secrets.token_urlsafe(32)`,
+~256 bits of entropy) that is both the sole scan identifier and the
+object-storage key (`scans/{token}/result.json`) — no sequential or
+guessable ID exists anywhere. `ScanRecord`/`HostResultRecord`/
+`CertificateRecord` are the JSON-safe persisted shape; `save_scan_record`/
+`load_scan_record` round-trip it through the `ObjectStorage` interface
+(M0). Persistence is one JSON document per scan in object storage — not
+PostgreSQL. See the CertWatch MVP Technical Specification v1 for the full
+rationale (Sections 2, 11).
 
 ## Milestone sequence
 
@@ -87,8 +96,8 @@ Specification v1 for the full rationale (Sections 2, 11).
 | **M0** | Repository, architecture skeleton, hosting/CI setup — provider-independent |
 | **M1** | Certificate parser + fixture test suite. No live network dependency |
 | **M2 gate** | Deployment target decided (local Windows dev, current) and the network-isolation mechanism documented for every supported target — resolved, see the Decision Log |
-| **M2** | TLS discovery + full SSRF/rebinding defense. `network_guard.py`, `tls_client.py`, `scanner.py`, full test suite passing (this README describes M0–M2) |
-| M3 | Object-storage persistence, token generation and lookup |
+| **M2** | TLS discovery + full SSRF/rebinding defense. `network_guard.py`, `tls_client.py`, `scanner.py`, full test suite passing |
+| **M3** | Object-storage persistence, token generation and lookup. `POST /api/scans` + `GET /api/scans/{token}` implemented end-to-end (this README describes M0–M3) |
 | M4 | Deterministic risk engine, including the five-category chain classification |
 | M5 | Report generation (PDF/CSV) |
 | M6 | Minimal UI, including the AI on/off toggle |
@@ -96,14 +105,36 @@ Specification v1 for the full rationale (Sections 2, 11).
 | M8 | Rate limiting, secrets management, deletion endpoint, prompt-injection tests |
 | M9 | End-to-end testing + first real dry run |
 
+## M3 — persistence and the scan API
+
+`POST /api/scans` runs the scan synchronously against M2's `scan_hosts`
+(there is no background-job queue at v0 — Section 2's own architecture
+table places "Background jobs" as "None customer-facing", and Section 19's
+worst-case estimate, ~85 seconds for 250 hosts, is sized for exactly this),
+generates a CSPRNG token, persists the result, and returns
+`{token, status, report_url}`. `GET /api/scans/{token}` looks the scan back
+up by token alone — no other authorization check exists or is needed
+(Section 12: the token *is* the access control). An unknown token is a 404,
+never a 403 or a different-shaped response, so a wrong guess reveals
+nothing. `source_ip` is persisted for abuse investigation only and is
+never present in any API response.
+
+`summary_counts` in the status response is, for now, a count of M2's
+`HostScanStatus` values (`ok`, `disallowed_port`, `handshake_failed`, ...)
+— **not** the risk-severity tiers Section 9's deterministic risk engine
+will eventually produce. M4 replaces/extends the data behind that field;
+the response shape itself doesn't change.
+
+Certificate deduplication across hosts sharing a certificate
+(`Certificate.duplicate_of`, grouping into `endpoints[]`) and
+`risk_severity` are also explicitly M4's job — M3 persists one record per
+submitted host:port, exactly as `scan_hosts` produced it.
+
 ## M2 — network scanning
 
 `app/scanning/` is fully implemented: hostname resolution, SSRF/DNS-rebinding
 defense, TLS handshake and full certificate-chain retrieval, and the
-concurrency/timeout-bounded scan pipeline. The `/api/scans` endpoint still
-returns HTTP 501 for every request — that's M3's job, since submitting a
-scan needs somewhere to persist its token and result, and object storage
-isn't wired up yet.
+concurrency/timeout-bounded scan pipeline.
 
 **The M2 gate (deployment target + network-isolation mechanism) is
 resolved.** The current, active deployment target is a **local Windows
@@ -134,12 +165,13 @@ make run
 ```
 
 The app serves at `http://localhost:8000/`. `/healthz` returns a liveness
-check; `/api/scans` and its sub-routes all return HTTP 501 until their owning
+check; `POST /api/scans` and `GET /api/scans/{token}` work end-to-end.
+Every other `/api/scans` sub-route still returns HTTP 501 until its owning
 milestone lands.
 
-No cloud account, API key, or network access is required to run or test
-CertWatch at M0 — the object-storage backend defaults to the local
-filesystem (`.data/scans/`, gitignored).
+No cloud account, API key, or network access beyond the actual scan
+targets is required to run or test CertWatch — the object-storage backend
+defaults to the local filesystem (`.data/scans/`, gitignored).
 
 ## How to run tests
 
