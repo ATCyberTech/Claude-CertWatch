@@ -12,6 +12,9 @@ dist/
 .env
 *.pem
 *.key
+# Exception: M1's checked-in test fixture certificates (public certs only —
+# no private key material is ever written to disk by generate_fixtures.py).
+!tests/fixtures/certs/*.pem
 
 # Local dev storage backend data (Section 11 — local filesystem is dev-only)
 .data/

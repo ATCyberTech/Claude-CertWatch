@@ -18,6 +18,7 @@ of the inline justification comments already present in `pyproject.toml`.
 | `cryptography` | §8, §10 | Low-level X.509 field parsing and signature primitives — explicitly **not** used for PKIX path building (see below) |
 | `pyhanko-certvalidator` | §8, Decision Log | The actual chain-validation engine: RFC 5280 path building, handles cross-signed certs and alternate paths, supports the two-pass validation algorithm needed to distinguish private-CA chains from broken ones. Selected specifically because `cryptography` + `certifi` alone do not perform path building — using them alone would have been an overclaim, corrected during the Final Implementation Clarifications pass |
 | `certifi` | §8 | Maintained public trust-root bundle used as Pass 1's trust anchor |
+| `asn1crypto` | §8, Decision Log (M1) | `pyhanko-certvalidator`'s own certificate representation; `app.parsing` imports it directly to build `ValidationContext` trust roots from the certifi bundle, so it is pinned explicitly rather than relied on only as a transitive dependency |
 | `slowapi` | §18 | Per-IP submission and `/ask` rate limiting without standing up a separate service |
 | `weasyprint` | §15 | Server-side HTML→PDF rendering for reports, no separate rendering service. Dependency is declared now; wiring is deferred to M5 |
 
@@ -44,3 +45,9 @@ object-storage design (Decision Log).
 - **ruff + mypy** as the lint/format/type-check toolchain — an M0
   implementation decision, recorded in the Decision Log per Rule 14.
 - **GitHub Actions** as the CI provider — same basis.
+- **`parse_certificate_chain` is async** — M1 implementation decision,
+  because `pyhanko-certvalidator`'s path validator (`async_validate_path`)
+  is async-only; the M0 stub signature was synchronous. Recorded in the
+  Decision Log.
+- **`mypy` overrides `asn1crypto.*` with `ignore_missing_imports`** —
+  `asn1crypto` ships no type stubs or `py.typed` marker.

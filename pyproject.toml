@@ -25,6 +25,10 @@ dependencies = [
     # cryptography + certifi alone was an overclaim, corrected in the Decision Log.
     "pyhanko-certvalidator>=0.26,<1.0",
     "certifi>=2024.7.4",          # maintained public trust-root bundle used as Pass 1's trust anchor
+    # asn1crypto: pyhanko-certvalidator's own certificate representation. Pinned explicitly
+    # (M1 decision, Decision Log) because app.parsing imports it directly to build
+    # ValidationContext trust roots — never relied on only as a transitive dependency.
+    "asn1crypto>=1.5.1",
 
     # --- Object storage abstraction (Section 11: no PostgreSQL at v0) ---
     # No cloud SDK (boto3 / azure-storage-blob / etc.) is pinned yet — cloud provider selection
@@ -60,6 +64,13 @@ python_version = "3.11"
 strict = true
 warn_unused_ignores = true
 disallow_untyped_defs = true
+
+# asn1crypto ships no type stubs / py.typed marker (M1 implementation note,
+# Decision Log) — it is used only in app.parsing for feeding pyhanko-certvalidator,
+# never for anything mypy needs to check the shape of beyond what's cast explicitly.
+[[tool.mypy.overrides]]
+module = ["asn1crypto.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

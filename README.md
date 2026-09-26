@@ -5,7 +5,8 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M0 — architecture skeleton. No scanning, parsing, storage, or AI
+**Status: M1 — certificate parsing and chain validation implemented,
+against local fixtures only. No live network scanning, storage, or AI
 logic is implemented yet.** See [M2 network scanning](#m2-network-scanning-is-not-yet-implemented)
 below.
 
@@ -43,7 +44,7 @@ package without restructuring the project:
 app/
   core/      — configuration (Settings), owned by M0
   scanning/  — DNS resolution, SSRF/rebinding guard, TLS discovery — M2
-  parsing/   — X.509 parsing, five-category chain classification — M1
+  parsing/   — X.509 parsing, five-category chain classification — DONE (M1)
   risk/      — deterministic risk engine, no LLM involvement — M4
   storage/   — object-storage abstraction (local backend at M0, cloud at M3)
   ai/        — LLM tool-calling layer, AI on/off toggle — M7
@@ -51,6 +52,14 @@ app/
   api/       — HTTP API routes (Section 13 route table, stubbed at M0) — M2-M8
   web/       — server-rendered UI — M6
 ```
+
+`app/parsing/certificate_parser.py` parses server-presented certificate
+chains and classifies chain outcome into one of five categories (Section 8)
+using `cryptography` for field extraction and `pyhanko-certvalidator` for
+RFC 5280 PKIX path validation via a two-pass algorithm (public trust bundle,
+then trust extended to the server's own presented certificates). It runs
+entirely against local fixtures (`tests/fixtures/certs/`) — no live network
+dependency, and `app.scanning` (M2) does not need to exist yet for M1 to work.
 
 Persistence is one JSON document + one PDF per scan in object storage, keyed
 by a CSPRNG-generated token — not PostgreSQL. See the CertWatch MVP Technical
@@ -60,8 +69,8 @@ Specification v1 for the full rationale (Sections 2, 11).
 
 | Milestone | Deliverable |
 | --- | --- |
-| **M0** | Repository, architecture skeleton, hosting/CI setup — provider-independent (this README describes M0) |
-| M1 | Certificate parser + fixture test suite. No live network dependency |
+| **M0** | Repository, architecture skeleton, hosting/CI setup — provider-independent |
+| **M1** | Certificate parser + fixture test suite. No live network dependency (this README describes M0+M1) |
 | **M2 gate** | Cloud provider selected and the network-isolation mechanism configured and verified, *before* any scanner code is written |
 | M2 | TLS discovery + full SSRF/rebinding design. Not complete until the SSRF/rebinding test suite passes |
 | M3 | Object-storage persistence, token generation and lookup |

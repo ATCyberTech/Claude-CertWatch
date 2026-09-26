@@ -1,11 +1,11 @@
 """Data model for parsed certificates — owned by M1.
 
-Defined ahead of M1's parsing logic so the data model (technical specification
-Section 10) is fixed as a module boundary now, and M1 fills in construction
-logic against an already-agreed shape rather than inventing the shape too.
-
-Fields mirror Section 10 exactly. Required/optional/derived status is noted
-per field; nothing here is populated at M0 — these are structural stubs only.
+Fields mirror Section 10, extended with `hostname_mismatch` (see below) —
+an M1 addition to carry category 5 (Section 8), which the specification
+describes as orthogonal to `chain_category` but did not enumerate as a
+named field. Recorded in the Decision Log as an M1 implementation
+decision. Populated for real by `certificate_parser.parse_certificate_chain`
+as of M1; `risk_severity` and `duplicate_of` remain unpopulated until M4.
 """
 
 from __future__ import annotations
@@ -58,11 +58,16 @@ class Certificate:
     signature_algorithm: str
     pem: str  # public certificate only — never a private key (Section 21)
 
-    # Derived — populated by M1 (chain_category) and M4 (everything risk-related)
+    # Derived — populated by M1 (chain_category, hostname_mismatch, is_expired,
+    # days_to_expiry, is_wildcard) and M4 (risk_severity, duplicate_of)
     chain_category: ChainCategory | None = None
     is_expired: bool | None = None
     days_to_expiry: int | None = None
     is_wildcard: bool | None = None  # informational metadata only (Decision Log)
+    # Category 5 (Section 8) — orthogonal to chain_category, can co-occur with
+    # any of the four ChainCategory values. True means the observed hostname
+    # does not match any SAN entry.
+    hostname_mismatch: bool | None = None
     risk_severity: str | None = None
     duplicate_of: str | None = None  # fingerprint_sha256 of the matching certificate, if any
 
