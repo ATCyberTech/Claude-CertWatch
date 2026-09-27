@@ -69,9 +69,10 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 # FastAPI's Depends()/Query()/Path() defaults are the framework's own
 # idiom for dependency injection, not the mutable-default-argument bug
-# B008 exists to catch (M3 implementation note, Decision Log).
+# B008 exists to catch (M3 implementation note, Decision Log). File()/Form()
+# are the same idiom for the M6 web-form routes (Decision Log).
 [tool.ruff.lint.flake8-bugbear]
-extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path"]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.File", "fastapi.Form"]
 
 [tool.mypy]
 python_version = "3.11"

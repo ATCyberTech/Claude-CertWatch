@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CertWatch — scan {{ record.token[:8] }}…</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: sans-serif; max-width: 60rem; margin: 3rem auto; line-height: 1.5; color: #1a1a1a; padding: 0 1rem; }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.15rem; margin-top: 2.5rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }
+    .meta { color: #555; font-size: 0.9rem; }
+    .badges { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+    .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 3px; font-size: 0.85rem; font-weight: bold; }
+    .sev-expired, .sev-weak_crypto, .sev-broken_chain { background: #7a1212; color: #fff; }
+    .sev-hostname_mismatch, .sev-critical { background: #c0392b; color: #fff; }
+    .sev-high { background: #e67e22; color: #fff; }
+    .sev-medium { background: #f1c40f; color: #1a1a1a; }
+    .sev-low, .sev-shared { background: #f5d76e; color: #1a1a1a; }
+    .sev-private_ca { background: #7f8c8d; color: #fff; }
+    .sev-ok, .sev-scan_failed { background: #27ae60; color: #fff; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+    th a { color: inherit; text-decoration: none; }
+    th a:hover { text-decoration: underline; }
+    .filters { margin: 0.5rem 0 1rem 0; font-size: 0.9rem; }
+    .filters a { margin-right: 0.5rem; }
+    .filters a.active { font-weight: bold; text-decoration: underline; }
+    .actions a { display: inline-block; margin-right: 0.75rem; padding: 0.4rem 1rem; background: #1a1a1a; color: #fff; border-radius: 4px; text-decoration: none; font-size: 0.9rem; }
+    .ask-box textarea { width: 100%; box-sizing: border-box; font-family: inherit; padding: 0.5rem; }
+    .notice { background: #fff8e1; color: #6b5300; border-radius: 4px; padding: 0.6rem 1rem; margin-top: 0.5rem; font-size: 0.9rem; }
+    .toggle-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
+    empty { color: #777; font-style: italic; }
+  </style>
+</head>
+<body>
+  <p><a href="/">&larr; New scan</a></p>
+  <h1>Scan report</h1>
+  <p class="meta">
+    Token: <code>{{ record.token }}</code> &middot;
+    Submitted: {{ record.submitted_at }} &middot;
+    Hosts submitted: {{ record.host_count }} &middot;
+    Status: {{ record.status }}
+  </p>
+
+  <h2>Risk summary</h2>
+  <div class="badges">
+    {% for sev, count in summary_counts.items() %}
+    <span class="badge sev-{{ sev }}">{{ sev }}: {{ count }}</span>
+    {% endfor %}
+  </div>
+
+  {% if top_findings %}
+  <p>Top findings:</p>
+  <ul>
+    {% for c in top_findings %}
+    <li>
+      <a href="/scans/{{ record.token }}/certificates/{{ c.fingerprint_sha256 }}">{{ c.subject_cn }}</a>
+      — <span class="badge sev-{{ c.risk_severity or 'ok' }}">{{ c.risk_severity or "ok" }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p><span class="empty">No certificates need attention — every discovered certificate is healthy.</span></p>
+  {% endif %}
+
+  <h2>Certificate inventory</h2>
+  <div class="filters">
+    Filter:
+    <a href="?sort={{ current_sort }}" class="{{ 'active' if not current_severity }}">all</a>
+    {% for sev in all_severities %}
+    <a href="?sort={{ current_sort }}&amp;severity={{ sev }}" class="{{ 'active' if current_severity == sev }}">{{ sev }}</a>
+    {% endfor %}
+  </div>
+  {% if certificates %}
+  <table>
+    <thead>
+      <tr>
+        <th><a href="?sort={{ '-' if current_sort == 'subject_cn' else '' }}subject_cn{{ ('&severity=' + current_severity) if current_severity else '' }}">Subject CN</a></th>
+        <th><a href="?sort={{ '-' if current_sort == 'severity' else '' }}severity{{ ('&severity=' + current_severity) if current_severity else '' }}">Severity</a></th>
+        <th><a href="?sort={{ '-' if current_sort == 'expiry' else '' }}expiry{{ ('&severity=' + current_severity) if current_severity else '' }}">Days remaining</a></th>
+        <th>Chain category</th>
+        <th>Endpoints</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in certificates %}
+      <tr>
+        <td><a href="/scans/{{ record.token }}/certificates/{{ c.fingerprint_sha256 }}">{{ c.subject_cn }}</a></td>
+        <td><span class="badge sev-{{ c.risk_severity or 'ok' }}">{{ c.risk_severity or "ok" }}</span></td>
+        <td>{{ c.days_to_expiry }}</td>
+        <td>{{ c.chain_category.value if c.chain_category else "—" }}</td>
+        <td>{% for e in c.endpoints %}{{ e.host }}:{{ e.port }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p><span class="empty">No certificates match this filter.</span></p>
+  {% endif %}
+
+  <h2>Ask CertWatch</h2>
+  <div class="toggle-row">
+    <form method="post" action="/scans/{{ record.token }}/ai-preference">
+      <label>
+        <input type="checkbox" name="ai_enabled" value="true" {{ "checked" if record.ai_enabled }}
+               onchange="this.form.submit()">
+        AI features enabled for this scan
+      </label>
+    </form>
+  </div>
+  {% if ai_ask_unavailable %}
+  <p class="notice">AI answers aren't available yet — the AI analyst layer is a later milestone (M7). The report, findings, and exports above are already complete without it.</p>
+  {% endif %}
+  <form class="ask-box" method="post" action="/scans/{{ record.token }}/ask">
+    <textarea name="question" rows="2" placeholder="Ask a question about these findings…" {{ "disabled" if not record.ai_enabled }}></textarea>
+    <button type="submit" {{ "disabled" if not record.ai_enabled }}>Ask</button>
+  </form>
+
+  <h2>Report / export</h2>
+  <div class="actions">
+    <a href="/api/scans/{{ record.token }}/report.pdf">Download PDF</a>
+    <a href="/api/scans/{{ record.token }}/report.csv">Download CSV</a>
+  </div>
+</body>
+</html>

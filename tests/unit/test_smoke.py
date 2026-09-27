@@ -19,10 +19,12 @@ def test_healthz_returns_ok(client: TestClient) -> None:
 
 
 def test_index_page_renders(client: TestClient) -> None:
+    """The M0 placeholder page was replaced by the real upload/scan page as
+    of M6 — see tests/unit/test_web_routes.py for full UI coverage."""
     response = client.get("/")
     assert response.status_code == 200
     assert "CertWatch" in response.text
-    assert "not yet implemented" in response.text
+    assert "Scan" in response.text
 
 
 def test_ask_not_yet_implemented(client: TestClient) -> None:

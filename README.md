@@ -5,16 +5,15 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M5 — report generation implemented. `POST /api/scans`,
-`GET /api/scans/{token}`, `GET /api/scans/{token}/findings`,
-`GET /api/scans/{token}/report.pdf`, and `GET /api/scans/{token}/report.csv`
-are all real, working endpoints: submit a host list, get back a CSPRNG
-token, look up its scan's risk-severity summary, page through its
-findings, and download a risk-tiered PDF or CSV report — all built from
-the same `app.risk`-computed findings, so the exports and the API can
-never disagree. `ask` and `ai-preference` still return HTTP 501 — each
-needs a later milestone (AI layer, UI) to have anything to serve.** See
-[M5 — report generation](#m5--report-generation) below.
+**Status: M6 — minimal UI implemented. A full server-rendered web
+workflow now sits on top of the M3–M5 JSON API: paste or upload a host
+list at `/`, watch it scan synchronously, and land on a results page with
+a risk summary, a sortable/filterable certificate inventory, per-
+certificate detail pages, PDF/CSV download links, and a visible AI
+on/off toggle (`PATCH /api/scans/{token}/ai-preference` is now real, not
+a stub). `ask`/the Ask CertWatch box still show "not available yet" —
+there is no AI layer to answer with until M7.** See
+[M6 — minimal UI](#m6--minimal-ui) below.
 
 ## What CertWatch is
 
@@ -53,10 +52,10 @@ app/
   parsing/   — X.509 parsing, five-category chain classification — DONE (M1)
   risk/      — deterministic risk engine, no LLM involvement — DONE (M4)
   storage/   — object-storage abstraction + scan persistence — DONE (M3)
-  ai/        — LLM tool-calling layer, AI on/off toggle — M7
+  ai/        — LLM tool-calling layer, AI on/off toggle enforcement — M7
   reports/   — PDF/CSV report generation — DONE (M5)
-  api/       — HTTP API routes (Section 13 route table) — submit/status/findings/report DONE (M3/M4/M5), rest M6-M8
-  web/       — server-rendered UI — M6
+  api/       — HTTP API routes (Section 13 route table) — all but /ask DONE (M3/M4/M5/M6), /ask still M7
+  web/       — server-rendered UI — DONE (M6)
 ```
 
 `app/parsing/certificate_parser.py` parses server-presented certificate
@@ -109,6 +108,14 @@ HTML to PDF via WeasyPrint; `build_csv_report` writes the same data as
 CSV via the standard library's `csv` module. No LLM involvement — report
 generation never blocks on an AI call.
 
+`app/web/routes.py` implements the minimal server-rendered UI (Section
+14): the upload/scan form, the scan results page (risk summary,
+sortable/filterable certificate inventory, Ask CertWatch box + AI
+toggle, report download links), and per-certificate detail pages. It
+calls the exact same `execute_scan`/`app.risk`/`app.reports` functions
+the JSON API uses — never its own copy of that logic — so the two front
+ends can never scan, score, or render a result differently.
+
 ## Milestone sequence
 
 | Milestone | Deliverable |
@@ -119,11 +126,64 @@ generation never blocks on an AI call.
 | **M2** | TLS discovery + full SSRF/rebinding defense. `network_guard.py`, `tls_client.py`, `scanner.py`, full test suite passing |
 | **M3** | Object-storage persistence, token generation and lookup. `POST /api/scans` + `GET /api/scans/{token}` implemented end-to-end |
 | **M4** | Deterministic risk engine (five-category chain classification was M1). `GET /api/scans/{token}/findings` implemented end-to-end; `summary_counts` now severity-based |
-| **M5** | Report generation (PDF/CSV). `GET /api/scans/{token}/report.pdf` and `.csv` implemented end-to-end (this README describes M0–M5) |
-| M6 | Minimal UI, including the AI on/off toggle |
+| **M5** | Report generation (PDF/CSV). `GET /api/scans/{token}/report.pdf` and `.csv` implemented end-to-end |
+| **M6** | Minimal UI, including the AI on/off toggle control. `app/web/routes.py` implemented end-to-end; `PATCH /api/scans/{token}/ai-preference` implemented (this README describes M0–M6) |
 | M7 | AI analyst layer, grounding/citation checks, AI-disabled enforcement |
 | M8 | Rate limiting, secrets management, deletion endpoint, prompt-injection tests |
 | M9 | End-to-end testing + first real dry run |
+
+## M6 — minimal UI
+
+`app/web/routes.py` implements Section 14's eight UI elements as a plain
+server-rendered (Jinja2, no React/SPA) workflow:
+
+1. **Upload/scan** (`GET /`) — paste a host list into a textarea and/or
+   upload a `.txt`/`.csv` file; both are parsed, combined, and
+   deduplicated (order-preserving) into one host list, then handed to
+   `POST /scan`, which calls `app.api.routes_scans.execute_scan` — the
+   exact function `POST /api/scans` itself calls — so pasted, uploaded,
+   and JSON-API submissions can never be scanned or persisted
+   differently. The page shows the spec's own scope note verbatim:
+   "public port 443 reachability only, no internal network access."
+2. **Scanning/progress** — trivial by construction: scans run
+   synchronously (M3), so by the time `POST /scan`'s redirect lands on
+   the results page the scan has already finished. No polling, no job
+   status, no separate progress UI needed.
+3. **Risk summary** — severity-tiered badge counts
+   (`summarize_risk_severity`) plus a "top findings" list (worst
+   severity, then soonest-expiring, capped at 5), each linking to its
+   certificate's detail page.
+4. **Certificate inventory** — a table over every certificate the risk
+   engine grouped and scored, sortable (`?sort=severity|expiry|subject_cn`,
+   a leading `-` reverses) and filterable by severity
+   (`?severity=critical`) via plain links and query parameters — no
+   client-side JS, consistent with Section 2's "no React/SPA."
+5. **Certificate detail** (`/scans/{token}/certificates/{fingerprint}`)
+   — chain category (visually distinct via a color-coded badge, one of
+   the five from Section 8), SAN list, and every observing endpoint.
+6. **Finding explanation** — absent entirely, not a placeholder. There
+   is no AI layer yet (M7); Section 14 itself says this element is
+   "absent entirely when AI is off," so there is nothing to build here
+   before an AI layer exists to explain anything (the same latitude M5
+   used for the report's own AI-narration slot).
+7. **Ask CertWatch + the AI on/off toggle** — the toggle
+   (`POST /scans/{token}/ai-preference`) is the real deliverable of this
+   milestone: it persists `scan.ai_enabled` via
+   `app.storage.scan_store.update_ai_preference`, the same
+   storage-mutation function the JSON `PATCH .../ai-preference` route
+   now calls too (previously a 501 stub). The question box posts to
+   `POST /scans/{token}/ask`, which calls the still-M7-stubbed
+   `ask_certwatch` and — on its expected 501 — shows a plain "not
+   available yet" notice instead of an error page, per Section 16's own
+   "Fallback" bullet ("if the LLM call fails, times out, or AI is
+   toggled off, the Ask box shows a plain message").
+8. **Report/export** — plain links to the M5 `/api/scans/{token}/report.pdf`/`.csv` routes.
+
+**What M6 does *not* do (explicitly out of scope, Decision Log):**
+enforce `ai_enabled` against any LLM call — there is no LLM call
+anywhere yet to gate, so "enforcement" has nothing to enforce; that is
+M7's job, once an AI layer exists. The toggle here is only the *control*
+Section 25's own M6 row names.
 
 ## M5 — report generation
 
@@ -262,11 +322,13 @@ cp .env.example .env
 make run
 ```
 
-The app serves at `http://localhost:8000/`. `/healthz` returns a liveness
-check; `POST /api/scans`, `GET /api/scans/{token}`,
-`GET /api/scans/{token}/findings`, and `GET /api/scans/{token}/report.pdf`
-/`.csv` all work end-to-end. `ask` and `ai-preference` still return HTTP
-501 until their owning milestone lands.
+The app serves at `http://localhost:8000/`. Open `/` in a browser for the
+full upload/scan-report workflow (M6), or use `/healthz` and the
+`/api/scans/...` JSON routes directly — `POST /api/scans`,
+`GET /api/scans/{token}`, `GET /api/scans/{token}/findings`,
+`GET /api/scans/{token}/report.pdf`/`.csv`, and
+`PATCH /api/scans/{token}/ai-preference` all work end-to-end. Only `ask`
+still returns HTTP 501, until M7 lands.
 
 No cloud account, API key, or network access beyond the actual scan
 targets is required to run or test CertWatch — the object-storage backend

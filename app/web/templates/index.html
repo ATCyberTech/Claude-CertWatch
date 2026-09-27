@@ -4,14 +4,36 @@
   <meta charset="utf-8">
   <title>CertWatch</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: sans-serif; max-width: 40rem; margin: 4rem auto; line-height: 1.5; color: #1a1a1a; }
+    .scope-note { background: #f2f2f2; border-radius: 4px; padding: 0.75rem 1rem; font-size: 0.9rem; color: #444; }
+    textarea { width: 100%; box-sizing: border-box; font-family: monospace; padding: 0.5rem; }
+    label { display: block; margin-top: 1rem; font-weight: bold; }
+    button { margin-top: 1rem; padding: 0.5rem 1.25rem; font-size: 1rem; cursor: pointer; }
+    .error { background: #fdecea; color: #7a1212; border-radius: 4px; padding: 0.75rem 1rem; margin-top: 1rem; }
+  </style>
 </head>
-<body style="font-family: sans-serif; max-width: 40rem; margin: 4rem auto; line-height: 1.5;">
+<body>
   <h1>CertWatch</h1>
-  <p>MVP v0 — architecture skeleton (M0). The upload/scan workflow is not implemented yet.</p>
-  <p>
-    <strong>M2 network scanning is not yet implemented.</strong>
-    No TLS discovery, certificate parsing, or scanning of any kind happens in this build.
+  <p>Upload a list of hosts and get a risk-tiered certificate report — no login, no credentials, no private key ever requested, transmitted, or stored.</p>
+  <p class="scope-note">Scope: public port 443 reachability only, no internal network access.</p>
+
+  {% if error %}
+  <p class="error">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/scan" enctype="multipart/form-data">
+    <label for="hosts_text">Paste a host list (one per line, or comma-separated)</label>
+    <textarea id="hosts_text" name="hosts_text" rows="8" placeholder="example.com&#10;mail.example.com:8443">{{ hosts_text }}</textarea>
+
+    <label for="hosts_file">…or upload a host-list file</label>
+    <input type="file" id="hosts_file" name="hosts_file" accept=".txt,.csv">
+
+    <button type="submit">Scan</button>
+  </form>
+
+  <p style="margin-top: 2rem; font-size: 0.85rem; color: #777;">
+    See the project README for milestone status and how to run tests.
   </p>
-  <p>See the project README for milestone status and how to run tests.</p>
 </body>
 </html>

@@ -12,7 +12,7 @@ of the inline justification comments already present in `pyproject.toml`.
 | `fastapi` | §2, §13, §14 | The application framework — a single monolith, no microservices |
 | `uvicorn[standard]` | §2 | ASGI server to run the FastAPI app |
 | `jinja2` | §2, §14 | Server-rendered report/UI templates — no React/SPA at v0 |
-| `python-multipart` | §14 | Required by FastAPI for the host-list upload form |
+| `python-multipart` | §14 | Required by FastAPI for the host-list upload form. Wired as of M6 (`app.web.routes`) |
 | `pydantic` | §24 | Typed request/response models and settings validation |
 | `pydantic-settings` | §24 | Server-side environment-variable configuration (never client-controlled) |
 | `cryptography` | §8, §10 | Low-level X.509 field parsing and signature primitives — explicitly **not** used for PKIX path building (see below) |
@@ -37,7 +37,10 @@ runtime dependency was needed for M4 either — the risk engine is pure
 Python over data `cryptography`/`pydantic` (already dependencies) already
 produce. No new runtime dependency was needed for M5 either — CSV export
 uses stdlib `csv`, not pandas, and `weasyprint`/`jinja2` were already
-declared dependencies, just not yet wired to anything.
+declared dependencies, just not yet wired to anything. No new runtime
+dependency was needed for M6 either — `fastapi`/`jinja2`/`python-multipart`
+were already declared (for exactly this purpose, per their own table
+rows above) and just not yet wired to a real UI.
 
 ## Dev / test dependencies
 
@@ -173,3 +176,27 @@ declared dependencies, just not yet wired to anything.
 - **`mypy` overrides `weasyprint.*` with `ignore_missing_imports`** (M5
   implementation note) — `weasyprint` ships no type stubs or `py.typed`
   marker, same class of fix as the existing `asn1crypto.*` override.
+- **`submit_scan`'s body is factored into a plain `execute_scan`
+  function**, called by both the JSON `POST /api/scans` route and the
+  web UI's `POST /scan` form handler (M6 implementation decision) — so
+  the two front ends can never scan or persist a submission differently;
+  `app.web` importing a function from `app.api.routes_scans` is a
+  one-directional dependency (the reverse never happens), so no import
+  cycle is introduced.
+- **The web UI's pasted-textarea and uploaded-file host lists are
+  combined and deduplicated (order-preserving), then split on newlines
+  and commas** (M6 implementation clarification) — Section 14 says only
+  "paste or upload a host list" without specifying a syntax or whether
+  both inputs can be used together; this implementation lets someone use
+  either or both without scanning a host twice.
+- **`ruff`'s `extend-immutable-calls` now also lists `fastapi.File` and
+  `fastapi.Form`** (M6 implementation note) — the same class of fix as
+  the existing `fastapi.Depends`/`Query`/`Path` entries: these are the
+  framework's own idiom for declaring a form field or file upload, not
+  the mutable-default-argument bug B008 exists to catch.
+- **`PATCH /api/scans/{token}/ai-preference` persists `scan.ai_enabled`
+  but enforces nothing** (M6 implementation decision) — this milestone
+  builds the toggle *control* Section 25's own M6 row names; there is no
+  LLM call anywhere yet to gate on the flag, so "enforcement" (never
+  calling the LLM when it's `False`) is explicitly left to M7, once an
+  AI layer exists to enforce it on.

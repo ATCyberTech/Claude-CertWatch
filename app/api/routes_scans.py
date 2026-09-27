@@ -1,10 +1,27 @@
 """Scan API routes — full Section 13 route table.
 
-`submit_scan`, `get_scan_status` (M3), `get_scan_findings` (M4), and
-`get_scan_report_pdf`/`get_scan_report_csv` (M5) are implemented. Every
-other handler remains a stub: each raises HTTPException(501) with a note
-on which milestone owns it — deliberate scaffolding, not a placeholder
-someone forgot to finish.
+`submit_scan`, `get_scan_status` (M3), `get_scan_findings` (M4),
+`get_scan_report_pdf`/`get_scan_report_csv` (M5), and
+`set_ai_preference` (M6, the toggle control itself — see below) are
+implemented. `ask_certwatch` remains a stub: it raises HTTPException(501)
+with a note on which milestone owns it (M7) — deliberate scaffolding, not
+a placeholder someone forgot to finish.
+
+Scan-execution note (M6 implementation decision, recorded in the Decision
+Log): `submit_scan`'s body (validate, scan, persist, render+persist the
+PDF) is factored out into `execute_scan`, a plain function with no
+FastAPI-specific dependencies of its own. `app.web.routes`'s host-list
+upload form calls the exact same function, so the JSON API and the
+server-rendered UI can never scan or persist a submission differently —
+`app.web` imports this module directly rather than re-implementing or
+HTTP-calling its own API.
+
+AI-preference note (M6 implementation decision, recorded in the Decision
+Log): `set_ai_preference` now actually persists `scan.ai_enabled` via
+`app.storage.scan_store.update_ai_preference` — this is the UI *toggle
+control* Section 25/M6 names. It does not enforce the flag anywhere
+(there is no LLM call anywhere yet to gate on it); that enforcement is
+explicitly M7's job, once an AI layer exists to enforce it on.
 
 Report generation note (M5 implementation decision, recorded in the
 Decision Log): the PDF is rendered once, synchronously, at the end of
@@ -63,6 +80,7 @@ from app.storage.scan_store import (
     load_scan_record,
     report_storage_key,
     save_scan_record,
+    update_ai_preference,
 )
 
 router = APIRouter(prefix="/api/scans", tags=["scans"])
@@ -162,21 +180,25 @@ class AiPreferenceResponse(BaseModel):
 # --- Routes (Section 13 table, in order) ---
 
 
-@router.post("", response_model=ScanSubmitResponse, status_code=201)
-async def submit_scan(
+async def execute_scan(
     payload: ScanSubmitRequest,
-    request: Request,
-    settings: Settings = Depends(get_settings),
-    storage: ObjectStorage = Depends(get_object_storage),
-) -> ScanSubmitResponse:
-    """Section 13: `POST /api/scans`.
+    settings: Settings,
+    storage: ObjectStorage,
+    source_ip: str | None,
+) -> ScanRecord:
+    """The actual submit-a-scan work, independent of any web framework:
+    validate, scan, persist, render+persist the PDF (M5). Both `submit_scan`
+    (JSON API) and `app.web.routes`'s host-list upload form (M6) call this
+    directly, so the two front ends can never scan or persist a submission
+    differently (Decision Log).
 
     Host count is capped at `settings.max_hosts_per_scan` (Section 19/24);
-    over the cap is a 422, not a silently-truncated scan. Runs the scan
-    synchronously against `app.scanning.scan_hosts` (M2) — Section 2's own
-    architecture table places "Background jobs" as "None customer-facing"
-    at v0, so there is no job queue to hand this off to; Section 19's own
-    worst-case estimate (250 hosts, ~85 seconds) is sized for exactly this.
+    over the cap is a 422 (`HTTPException`), not a silently-truncated scan.
+    Runs the scan synchronously against `app.scanning.scan_hosts` (M2) —
+    Section 2's own architecture table places "Background jobs" as "None
+    customer-facing" at v0, so there is no job queue to hand this off to;
+    Section 19's own worst-case estimate (250 hosts, ~85 seconds) is sized
+    for exactly this.
     """
     host_count = len(payload.hosts)
     if host_count > settings.max_hosts_per_scan:
@@ -197,7 +219,7 @@ async def submit_scan(
         submitted_at=datetime.now(UTC),
         host_count=host_count,
         status="complete",
-        source_ip=request.client.host if request.client else None,
+        source_ip=source_ip,
         ai_enabled=settings.ai_enabled_by_default,
         host_results=[host_outcome_to_record(outcome) for outcome in outcomes],
     )
@@ -207,8 +229,22 @@ async def submit_scan(
     apply_risk_engine(certificates)
     storage.put(report_storage_key(token), build_pdf_report(record, certificates))
 
-    report_url = str(request.url_for("get_scan_report_pdf", token=token))
-    return ScanSubmitResponse(token=token, status=record.status, report_url=report_url)
+    return record
+
+
+@router.post("", response_model=ScanSubmitResponse, status_code=201)
+async def submit_scan(
+    payload: ScanSubmitRequest,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> ScanSubmitResponse:
+    """Section 13: `POST /api/scans`. See `execute_scan` for the actual work."""
+    record = await execute_scan(
+        payload, settings, storage, request.client.host if request.client else None
+    )
+    report_url = str(request.url_for("get_scan_report_pdf", token=record.token))
+    return ScanSubmitResponse(token=record.token, status=record.status, report_url=report_url)
 
 
 @router.get("/{token}", response_model=ScanStatusResponse)
@@ -349,6 +385,17 @@ def ask_certwatch(token: str, request: AskRequest) -> AskResponse:
 
 
 @router.patch("/{token}/ai-preference", response_model=AiPreferenceResponse)
-def set_ai_preference(token: str, request: AiPreferenceRequest) -> AiPreferenceResponse:
-    """Owned by M6 (UI toggle) + M7 (enforcement)."""
-    raise _not_implemented("M6/M7")
+def set_ai_preference(
+    token: str,
+    request: AiPreferenceRequest,
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> AiPreferenceResponse:
+    """Section 13/16: `PATCH /api/scans/{token}/ai-preference` — the toggle
+    *control* itself, owned by M6. Persists `scan.ai_enabled`
+    (`app.storage.scan_store.update_ai_preference`); does not gate any LLM
+    call on it, since none exists yet — that enforcement is M7's job.
+    """
+    record = update_ai_preference(storage, token, request.ai_enabled)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown scan token.")
+    return AiPreferenceResponse(ai_enabled=record.ai_enabled)

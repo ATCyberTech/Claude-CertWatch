@@ -21,6 +21,11 @@ deployment target (M2 gate decision) and no cloud credentials exist to
 test against — the `ObjectStorage` interface (M0) already makes that
 swap-in trivial the moment a specific cloud target is actually stood up,
 so speculatively wiring one now would be untested, unused code.
+
+M6 adds `update_ai_preference` — the per-scan `ai_enabled` toggle's
+storage-mutation logic (Section 16/17), shared by the JSON API's PATCH
+route and the web UI's toggle form. No enforcement of the flag exists
+yet; that's M7's job once an AI layer exists to enforce it on.
 """
 
 from __future__ import annotations
@@ -191,6 +196,24 @@ def load_scan_record(storage: ObjectStorage, token: str) -> ScanRecord | None:
     if raw is None:
         return None
     return ScanRecord.model_validate(json.loads(raw))
+
+
+def update_ai_preference(storage: ObjectStorage, token: str, ai_enabled: bool) -> ScanRecord | None:
+    """Flip `scan.ai_enabled` (Section 16/17) for an existing scan and persist
+    it — owned by M6 (the toggle control itself). Shared by the JSON
+    `PATCH /api/scans/{token}/ai-preference` route and the web UI's toggle
+    form so the two never disagree about how the flag is stored. Returns
+    `None` for an unknown token (the caller renders its own 404), the
+    updated record otherwise. Enforcement of this flag — never calling the
+    LLM when it's `False` — is M7's job, once an LLM layer exists to
+    enforce it on; there is nothing to enforce against yet.
+    """
+    record = load_scan_record(storage, token)
+    if record is None:
+        return None
+    record.ai_enabled = ai_enabled
+    save_scan_record(storage, record)
+    return record
 
 
 def summarize_host_statuses(host_results: list[HostResultRecord]) -> dict[str, int]:

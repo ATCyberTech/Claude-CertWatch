@@ -1,17 +1,281 @@
-"""Web UI routes — one placeholder page at M0, real screens owned by M6."""
+"""Web UI routes — Section 14, owned by M6.
+
+Server-rendered only (Jinja2, no React/SPA — Section 2). Every page here
+reads the same persisted `ScanRecord` and calls the same
+`app.risk`/`app.reports` building blocks the JSON API uses; the host-list
+upload form calls `app.api.routes_scans.execute_scan` directly (the exact
+function `POST /api/scans` itself calls), so the web UI and the JSON API
+can never scan or persist a submission differently (Decision Log).
+
+Section 14's eight UI elements, and where each lives:
+  1. Upload/scan               -> `index` (GET /) + `submit_scan_via_web` (POST /scan)
+  2. Scanning/progress          -> trivial: scans run synchronously (M3), so by
+                                    the time the redirect lands on `scan_status_page`
+                                    the scan is already `complete`; no polling needed.
+  3. Risk summary                -> `scan_status_page` (severity counts + top findings)
+  4. Certificate inventory        -> `scan_status_page` (sortable/filterable via
+                                    `?sort=` / `?severity=` query params — plain links,
+                                    no JS, consistent with "no React/SPA")
+  5. Certificate detail            -> `certificate_detail_page`
+  6. Finding explanation (AI)       -> absent entirely — no AI layer exists yet (M7);
+                                    Section 14 itself says this is "absent entirely
+                                    when AI is off," so omitting it before AI even
+                                    exists needs no placeholder (same latitude M5
+                                    used for the report's AI-narration slot).
+  7. Ask CertWatch + AI toggle       -> `scan_status_page` renders both; the toggle
+                                    posts to `toggle_ai_preference_web`, the question
+                                    box posts to `ask_certwatch_web` (which calls the
+                                    still-M7-stubbed `ask_certwatch` and shows a plain
+                                    "not available yet" notice on the expected 501,
+                                    per Section 16's own "Fallback" bullet).
+  8. Report/export                  -> plain links to the M5 `.../report.pdf`/`.csv` routes.
+"""
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
+from starlette.responses import Response
+
+from app.api.routes_scans import (
+    AskRequest,
+    ScanSubmitRequest,
+    ask_certwatch,
+    execute_scan,
+)
+from app.core.config import Settings, get_settings
+from app.parsing.models import Certificate
+from app.risk.risk_engine import (
+    apply_risk_engine,
+    evaluate_flags,
+    group_into_certificates,
+    severity_sort_key,
+    summarize_risk_severity,
+)
+from app.storage import get_object_storage
+from app.storage.interface import ObjectStorage
+from app.storage.scan_store import ScanRecord, load_scan_record, update_ai_preference
 
 router = APIRouter(tags=["web"])
 _templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
+def _parse_host_list(*sources: str) -> list[str]:
+    """Split one or more freeform blocks of pasted/uploaded text into a
+    deduplicated (order-preserving) host list — one host per line, or
+    comma-separated within a line, matching how someone would naturally
+    paste a list of hosts (M6 implementation clarification: Section 14
+    just says "paste or upload a host list" without specifying a syntax).
+    """
+    seen: dict[str, None] = {}
+    for source in sources:
+        for line in source.splitlines():
+            for piece in line.split(","):
+                host = piece.strip()
+                if host:
+                    seen[host] = None
+    return list(seen.keys())
+
+
 @router.get("/")
-def index(request: Request) -> object:
-    """M0 placeholder landing page — proves the Jinja2 pipeline, nothing more."""
-    return _templates.TemplateResponse(request, "index.html", {})
+def index(request: Request, error: str | None = None, hosts_text: str = "") -> Response:
+    """Section 14 element 1 (upload/scan): paste-or-upload a host list, with
+    the spec's own visible scope note."""
+    return _templates.TemplateResponse(
+        request, "index.html", {"error": error, "hosts_text": hosts_text}
+    )
+
+
+@router.post("/scan")
+async def submit_scan_via_web(
+    request: Request,
+    hosts_text: str = Form(""),
+    hosts_file: UploadFile | None = File(None),
+    settings: Settings = Depends(get_settings),
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> Response:
+    """Parses the pasted/uploaded host list and hands it straight to
+    `app.api.routes_scans.execute_scan` — the same function `POST
+    /api/scans` calls — then redirects to the results page (Section 14
+    element 2: by the time this redirect lands, the synchronous scan
+    (M3) has already finished, so there is no separate progress poll)."""
+    file_text = ""
+    if hosts_file is not None and hosts_file.filename:
+        file_text = (await hosts_file.read()).decode("utf-8", errors="ignore")
+
+    hosts = _parse_host_list(hosts_text, file_text)
+
+    try:
+        payload = ScanSubmitRequest(hosts=hosts)
+        record = await execute_scan(
+            payload, settings, storage, request.client.host if request.client else None
+        )
+    except ValidationError:
+        return _templates.TemplateResponse(
+            request,
+            "index.html",
+            {"error": "Enter at least one host to scan.", "hosts_text": hosts_text},
+            status_code=422,
+        )
+    except HTTPException as exc:
+        return _templates.TemplateResponse(
+            request,
+            "index.html",
+            {"error": exc.detail, "hosts_text": hosts_text},
+            status_code=exc.status_code,
+        )
+
+    return RedirectResponse(url=f"/scans/{record.token}", status_code=303)
+
+
+_SORT_KEYS = {
+    "severity": lambda c: severity_sort_key(c.risk_severity or "ok"),
+    "expiry": lambda c: c.days_to_expiry if c.days_to_expiry is not None else 0,
+    "subject_cn": lambda c: c.subject_cn,
+}
+_DEFAULT_SORT = "severity"
+
+
+def _sort_certificates(certificates: list[Certificate], sort: str) -> list[Certificate]:
+    reverse = sort.startswith("-")
+    field = sort[1:] if reverse else sort
+    key_fn = _SORT_KEYS.get(field, _SORT_KEYS[_DEFAULT_SORT])
+    return sorted(certificates, key=key_fn, reverse=reverse)
+
+
+def _load_certificates(
+    storage: ObjectStorage, token: str
+) -> tuple[ScanRecord, list[Certificate]] | None:
+    record = load_scan_record(storage, token)
+    if record is None:
+        return None
+    certificates = group_into_certificates(record)
+    apply_risk_engine(certificates)
+    return record, certificates
+
+
+@router.get("/scans/{token}")
+async def scan_status_page(
+    request: Request,
+    token: str,
+    sort: str = _DEFAULT_SORT,
+    severity: str | None = None,
+    ai_ask_unavailable: bool = False,
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> Response:
+    """Section 14 elements 2, 3, 4, 7, 8: status, risk summary, the
+    sortable/filterable certificate inventory, the Ask box + AI toggle, and
+    the report download links, all on one page."""
+    loaded = _load_certificates(storage, token)
+    if loaded is None:
+        return _templates.TemplateResponse(
+            request, "not_found.html", {"token": token}, status_code=404
+        )
+    record, certificates = loaded
+
+    all_severities = sorted({c.risk_severity or "ok" for c in certificates})
+    inventory = [
+        c for c in certificates if severity is None or (c.risk_severity or "ok") == severity
+    ]
+    inventory = _sort_certificates(inventory, sort)
+
+    top_findings = sorted(
+        (c for c in certificates if (c.risk_severity or "ok") != "ok"),
+        key=lambda c: (
+            severity_sort_key(c.risk_severity or "ok"),
+            c.days_to_expiry if c.days_to_expiry is not None else 0,
+        ),
+    )[:5]
+
+    return _templates.TemplateResponse(
+        request,
+        "scan_status.html",
+        {
+            "record": record,
+            "summary_counts": summarize_risk_severity(record),
+            "top_findings": top_findings,
+            "certificates": inventory,
+            "all_severities": all_severities,
+            "current_sort": sort,
+            "current_severity": severity or "",
+            "ai_ask_unavailable": ai_ask_unavailable,
+        },
+    )
+
+
+@router.get("/scans/{token}/certificates/{fingerprint}")
+async def certificate_detail_page(
+    request: Request,
+    token: str,
+    fingerprint: str,
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> Response:
+    """Section 14 element 5: chain category (visually distinct), SAN list,
+    endpoints, for one certificate found in this scan."""
+    loaded = _load_certificates(storage, token)
+    if loaded is None:
+        return _templates.TemplateResponse(
+            request, "not_found.html", {"token": token}, status_code=404
+        )
+    record, certificates = loaded
+    certificate = next((c for c in certificates if c.fingerprint_sha256 == fingerprint), None)
+    if certificate is None:
+        return _templates.TemplateResponse(
+            request, "not_found.html", {"token": token}, status_code=404
+        )
+
+    return _templates.TemplateResponse(
+        request,
+        "certificate_detail.html",
+        {
+            "record": record,
+            "certificate": certificate,
+            "flags": evaluate_flags(certificate, certificates),
+        },
+    )
+
+
+@router.post("/scans/{token}/ai-preference")
+async def toggle_ai_preference_web(
+    request: Request,
+    token: str,
+    ai_enabled: bool = Form(False),
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> Response:
+    """Section 14 element 7's visible AI on/off control (Section 16/17):
+    posts straight to `app.storage.scan_store.update_ai_preference`, the
+    same storage-mutation function the JSON `PATCH .../ai-preference`
+    route uses."""
+    record = update_ai_preference(storage, token, ai_enabled)
+    if record is None:
+        return _templates.TemplateResponse(
+            request, "not_found.html", {"token": token}, status_code=404
+        )
+    return RedirectResponse(url=f"/scans/{token}", status_code=303)
+
+
+@router.post("/scans/{token}/ask")
+async def ask_certwatch_web(
+    request: Request,
+    token: str,
+    question: str = Form(...),
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> Response:
+    """Section 14 element 7's question box. `ask_certwatch` is still M7's
+    501 stub — no AI layer exists yet — so this calls it, catches that
+    expected failure, and shows a plain notice instead of a raw error page
+    (Section 16's own "Fallback" bullet: "if the LLM call fails, times
+    out, or AI is toggled off, the Ask box shows a plain message")."""
+    record = load_scan_record(storage, token)
+    if record is None:
+        return _templates.TemplateResponse(
+            request, "not_found.html", {"token": token}, status_code=404
+        )
+    with contextlib.suppress(HTTPException):
+        ask_certwatch(token, AskRequest(question=question))
+    return RedirectResponse(url=f"/scans/{token}?ai_ask_unavailable=1", status_code=303)

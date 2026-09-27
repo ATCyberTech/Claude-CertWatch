@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CertWatch — {{ certificate.subject_cn }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: sans-serif; max-width: 45rem; margin: 3rem auto; line-height: 1.5; color: #1a1a1a; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; word-break: break-all; }
+    .badge { display: inline-block; padding: 0.2rem 0.7rem; border-radius: 3px; font-size: 0.85rem; font-weight: bold; margin-bottom: 1rem; }
+    .chain-self_signed { background: #7f8c8d; color: #fff; }
+    .chain-public_ca { background: #27ae60; color: #fff; }
+    .chain-private_ca { background: #2980b9; color: #fff; }
+    .chain-broken { background: #7a1212; color: #fff; }
+    .chain-unknown { background: #bdc3c7; color: #1a1a1a; }
+    .sev-badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 3px; font-size: 0.85rem; font-weight: bold; }
+    dl { display: grid; grid-template-columns: 12rem 1fr; gap: 0.4rem 1rem; }
+    dt { font-weight: bold; color: #444; }
+    dd { margin: 0; word-break: break-word; }
+    ul { padding-left: 1.2rem; }
+    .flags span { display: inline-block; background: #f2f2f2; border-radius: 3px; padding: 0.1rem 0.5rem; margin: 0 0.3rem 0.3rem 0; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <p><a href="/scans/{{ record.token }}">&larr; Back to scan report</a></p>
+  <h1>{{ certificate.subject_cn }}</h1>
+  <span class="badge chain-{{ certificate.chain_category.value if certificate.chain_category else 'unknown' }}">
+    {{ certificate.chain_category.value if certificate.chain_category else "unknown chain" }}
+  </span>
+  <span class="sev-badge sev-{{ certificate.risk_severity or 'ok' }}" style="background:#eee;">
+    {{ certificate.risk_severity or "ok" }}
+  </span>
+
+  {% if flags %}
+  <p class="flags">
+    {% for f in flags %}<span>{{ f }}</span>{% endfor %}
+  </p>
+  {% endif %}
+
+  <dl>
+    <dt>Fingerprint (SHA-256)</dt><dd><code>{{ certificate.fingerprint_sha256 }}</code></dd>
+    <dt>Issuer</dt><dd>{{ certificate.issuer }}</dd>
+    <dt>Serial number</dt><dd><code>{{ certificate.serial_number }}</code></dd>
+    <dt>Key algorithm</dt><dd>{{ certificate.key_algorithm }}</dd>
+    <dt>Signature algorithm</dt><dd>{{ certificate.signature_algorithm }}</dd>
+    <dt>Valid from</dt><dd>{{ certificate.not_before }}</dd>
+    <dt>Valid until</dt><dd>{{ certificate.not_after }}</dd>
+    <dt>Days to expiry</dt><dd>{{ certificate.days_to_expiry }}</dd>
+    <dt>Hostname mismatch</dt><dd>{{ "yes" if certificate.hostname_mismatch else "no" }}</dd>
+  </dl>
+
+  <h2>SAN list</h2>
+  <ul>
+    {% for san in certificate.san_list %}
+    <li>{{ san }}</li>
+    {% endfor %}
+  </ul>
+
+  <h2>Endpoints</h2>
+  <ul>
+    {% for e in certificate.endpoints %}
+    <li>{{ e.host }}:{{ e.port }}{% if e.environment %} ({{ e.environment }}){% endif %}{% if e.owner %} — owner: {{ e.owner }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+</body>
+</html>
