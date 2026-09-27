@@ -5,16 +5,15 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M8 — rate limiting, secrets management, deletion endpoint, and
-prompt-injection tests implemented. `submit_scan` and `/ask` now enforce
-Section 18's exact numbers (5/hour/IP submissions; 20 questions/scan
-lifetime cap; 60/hour/IP questions); `DELETE /api/scans/{token}` removes
-a scan's stored data on request; a `Referrer-Policy: no-referrer` header
-and scan-token log redaction close a Section 12 gap open since M3; and
-new tests validate that prompt-injection-style certificate content never
-changes model behavior.** See [M8 — rate limiting, secrets
-management, deletion endpoint](#m8--rate-limiting-secrets-management-deletion-endpoint)
-below.
+**Status: M9 — real-network end-to-end tests added (`tests/e2e/`, opt-in
+via `pytest -m e2e`), exercising the full user journey against real
+DNS/TCP/TLS rather than a monkeypatched scanner. The other half of this
+milestone — a first real dry run against the founder's own GCC contacts
+— needs real target hostnames from the founder and a network that
+doesn't intercept TLS (this dev sandbox's own outbound HTTPS is
+transparently intercepted — see below); it isn't something this
+container can perform meaningfully on its own.** See
+[M9 — end-to-end testing](#m9--end-to-end-testing) below.
 
 ## What CertWatch is
 
@@ -130,8 +129,58 @@ ends can never scan, score, or render a result differently.
 | **M5** | Report generation (PDF/CSV). `GET /api/scans/{token}/report.pdf` and `.csv` implemented end-to-end |
 | **M6** | Minimal UI, including the AI on/off toggle control. `app/web/routes.py` implemented end-to-end; `PATCH /api/scans/{token}/ai-preference` implemented |
 | **M7** | AI analyst layer, grounding/citation checks, AI-disabled enforcement. `POST /api/scans/{token}/ask` implemented end-to-end |
-| **M8** | Rate limiting (Section 18), secrets management, deletion endpoint, prompt-injection tests. `DELETE /api/scans/{token}` implemented end-to-end (this README describes M0–M8) |
-| M9 | End-to-end testing + first real dry run |
+| **M8** | Rate limiting (Section 18), secrets management, deletion endpoint, prompt-injection tests. `DELETE /api/scans/{token}` implemented end-to-end |
+| **M9** | End-to-end testing (done — `tests/e2e/`) + first real dry run against the founder's own GCC contacts (blocked on real target hostnames + a non-TLS-intercepting network — see below; this README describes M0–M9) |
+
+## M9 — end-to-end testing
+
+Section 25's M9 row is two things: end-to-end testing, and a first real
+dry run against the founder's own GCC contacts. Only the first is
+something this project's own code and this dev sandbox can deliver; the
+second needs the founder's own input and a suitable network (see
+`docs/M9_CHECKLIST.md` for the full breakdown).
+
+- **Real-network e2e tests** (`tests/e2e/`): every other test in this
+  project monkeypatches `app.scanning.scan_hosts` to a canned outcome —
+  correct for testing API wiring in isolation, but it never proves the
+  real scanning pipeline works as one system. These tests don't
+  monkeypatch anything: they submit real hostnames (`example.com` and a
+  couple of `badssl.com` subdomains, a public TLS-testing service — no
+  real business's infrastructure) and let real DNS resolution, a real
+  TCP connect, and a real TLS handshake run, then walk the full user
+  journey — submit, status, findings, PDF/CSV export, the AI toggle and
+  `/ask` fallback, rate limits, and deletion — against the live app.
+  They're opt-in (`pytest -m e2e`), not part of the default `pytest -q`
+  run every prior milestone's fast unit suite relied on, since they need
+  real internet egress a CI runner may not have.
+- **A significant environmental finding surfaced while building these
+  tests, recorded in the Decision Log:** this sandboxed dev container's
+  outbound HTTPS is transparently TLS-intercepted by an Anthropic egress
+  proxy. A real scan of `example.com` run from here receives a
+  certificate issued by `CN=Egress Gateway SDS Issuing CA (production),
+  O=Anthropic` — never the origin's real, publicly-issued certificate.
+  Raw TCP/TLS reachability to arbitrary public hosts is otherwise fine;
+  the problem is strictly that certificate *content* seen from this
+  container always reflects the interception proxy, not the real origin
+  server. Two consequences: the e2e tests deliberately don't assert on
+  `is_expired`/`chain_category`/`hostname_mismatch` values (what
+  `badssl.com`'s hostnames are specifically for), only that the pipeline
+  runs correctly and produces internally-consistent findings; and Section
+  25's "first real dry run against the founder's own GCC contacts" can't
+  be performed meaningfully from this container at all — every scan
+  would report the interception proxy's certificate, not the target
+  organization's, which would be actively misleading rather than merely
+  incomplete.
+- **What the real dry run still needs**, once picked back up: real target
+  hostnames from the founder (CertWatch can't invent or guess which
+  companies are "the founder's own GCC contacts," and scanning real
+  third-party infrastructure needs the founder's own knowledge that a
+  passive, read-only TLS handshake against those hosts is fine — no
+  login, no credentials, nothing written, the same connection any
+  browser visiting the site makes), run from a network that doesn't
+  intercept TLS (the founder's own machine is simplest, and is already
+  the local-dev target per the M2 gate decision). No new code is needed
+  for it — M0–M8 already built everything it exercises.
 
 ## M8 — rate limiting, secrets management, deletion endpoint
 
@@ -443,11 +492,19 @@ message rather than an error). To get real AI answers, set `LLM_API_KEY`
 ## How to run tests
 
 ```bash
-make test        # pytest
+make test        # pytest (fast unit suite only — real-network e2e tests are opt-in, see below)
 make lint         # ruff check
 make fmt          # ruff format
 make typecheck    # mypy
 make check        # all of the above, same order as CI
+```
+
+`tests/e2e/` (M9) hits real public hosts over real DNS/TCP/TLS and is
+excluded from the default run (`addopts = "-m 'not e2e'"` in
+`pyproject.toml`). Run it explicitly, with real internet access:
+
+```bash
+python -m pytest -m e2e -v
 ```
 
 ## Dependencies

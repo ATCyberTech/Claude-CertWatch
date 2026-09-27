@@ -317,3 +317,26 @@ new runtime dependency, `anthropic`** — no dev/test dependency was needed;
   deletion endpoint reuses the existing `ObjectStorage.delete` (present
   since M0); log redaction and the Referrer-Policy header use only the
   stdlib `logging` module and Starlette's own middleware hook.
+- **M9's real-network e2e tests (`tests/e2e/`) are opt-in via a
+  registered `e2e` pytest marker, excluded from the default `pytest -q`
+  run by `addopts = "-m 'not e2e'"`** (M9 implementation decision) —
+  every other test in this project monkeypatches `scan_hosts` and needs
+  no network; these hit real public hosts over real DNS/TCP/TLS, which a
+  CI runner may not have and which would otherwise slow down the
+  fast, always-run unit suite every prior milestone relied on.
+- **This sandboxed dev container's outbound HTTPS is transparently
+  TLS-intercepted by an Anthropic egress proxy** (M9 finding, recorded in
+  the Decision Log) — confirmed by direct inspection: a real scan of
+  `example.com` run from here receives a certificate issued by `CN=Egress
+  Gateway SDS Issuing CA (production), O=Anthropic`, never the origin's
+  real certificate. Raw TCP/TLS reachability to arbitrary public hosts on
+  port 443 is otherwise unrestricted (unlike the HTTP(S) proxy governing
+  `curl`/`pip`/etc.) — the problem is strictly that certificate *content*
+  seen here always reflects the interception proxy, not the real origin
+  server. This blocks two things specifically: validating `badssl.com`'s
+  expired/self-signed/hostname-mismatch claims from this container (the
+  e2e tests deliberately don't assert on them), and Section 25's "first
+  real dry run against the founder's own GCC contacts," which needs both
+  real target hostnames only the founder can supply and a network path
+  that doesn't intercept TLS (the founder's own machine, per the M2 gate
+  decision's local-Windows-dev target) — see `docs/M9_CHECKLIST.md`.

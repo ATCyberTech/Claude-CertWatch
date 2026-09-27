@@ -104,6 +104,12 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# M9: real-network e2e tests (tests/e2e/) hit real public hosts over real
+# DNS/TCP/TLS — no monkeypatched scan_hosts — so they're opt-in, not part
+# of the default fast/CI-friendly run every other milestone's `pytest -q`
+# has relied on. Run them explicitly with `pytest -m e2e` (Decision Log).
+markers = ["e2e: real-network end-to-end tests against public test hosts (opt-in, see tests/e2e/)"]
+addopts = "-m 'not e2e'"
 
 [build-system]
 requires = ["setuptools>=68"]
