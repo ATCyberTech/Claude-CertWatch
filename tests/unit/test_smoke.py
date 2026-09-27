@@ -27,11 +27,10 @@ def test_index_page_renders(client: TestClient) -> None:
     assert "Scan" in response.text
 
 
-def test_ask_not_yet_implemented(client: TestClient) -> None:
-    """M7 (AI analyst layer) owns this route — `/api/scans`,
-    `/api/scans/{token}/findings`, and `/api/scans/{token}/report.pdf|csv`
-    are implemented as of M3/M4/M5; see tests/unit/test_routes_scans.py and
-    tests/unit/test_report_builder.py for those."""
+def test_ask_unknown_token_is_404(client: TestClient) -> None:
+    """`/ask` is implemented as of M7 — see tests/unit/test_routes_scans.py
+    and tests/unit/test_ai_analyst.py for full AI-layer coverage. This
+    smoke test only proves the route exists and 404s like every other
+    `/api/scans/{token}/...` route on an unknown token."""
     response = client.post("/api/scans/some-token/ask", json={"question": "test?"})
-    assert response.status_code == 501
-    assert "M7" in response.json()["detail"]
+    assert response.status_code == 404

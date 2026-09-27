@@ -1,11 +1,21 @@
 """Scan API routes — full Section 13 route table.
 
 `submit_scan`, `get_scan_status` (M3), `get_scan_findings` (M4),
-`get_scan_report_pdf`/`get_scan_report_csv` (M5), and
-`set_ai_preference` (M6, the toggle control itself — see below) are
-implemented. `ask_certwatch` remains a stub: it raises HTTPException(501)
-with a note on which milestone owns it (M7) — deliberate scaffolding, not
-a placeholder someone forgot to finish.
+`get_scan_report_pdf`/`get_scan_report_csv` (M5), `set_ai_preference` (M6,
+the toggle control itself), and `ask_certwatch` (M7, the AI analyst layer)
+are all implemented.
+
+AI-analyst note (M7 implementation decision, recorded in the Decision
+Log): `ask_certwatch`'s body is factored into a plain `answer_scan_question`
+function, mirroring `execute_scan`'s M6 pattern — `app.web.routes`'s Ask
+box calls this same function directly, so the JSON API and the web UI can
+never answer a question differently. `answer_scan_question` 404s on an
+unknown token, then delegates all AI-disabled enforcement, provider
+selection, and grounding/fallback logic to `app.ai.analyst.answer_question`
+— this route module has no AI logic of its own. `build_llm_provider`
+returns `None` when no `LLM_API_KEY` is configured (a plain-message
+fallback, not an error) — this is expected in this sandboxed dev
+environment and in the user's own local setup until they supply a key.
 
 Scan-execution note (M6 implementation decision, recorded in the Decision
 Log): `submit_scan`'s body (validate, scan, persist, render+persist the
@@ -60,6 +70,8 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, model_validator
 
+from app.ai.analyst import answer_question
+from app.ai.llm_client import AnthropicProvider, LLMProvider
 from app.core.config import Settings, get_settings
 from app.parsing.models import Certificate
 from app.reports.report_builder import build_csv_report, build_pdf_report
@@ -86,14 +98,6 @@ from app.storage.scan_store import (
 router = APIRouter(prefix="/api/scans", tags=["scans"])
 
 _DEFAULT_SCAN_PORT = 443
-
-
-def _not_implemented(owning_milestone: str) -> HTTPException:
-    return HTTPException(
-        status_code=501,
-        detail=f"Not implemented yet — owned by {owning_milestone}. "
-        "See the CertWatch MVP Technical Specification v1, Section 13/25.",
-    )
 
 
 # --- Request/response models (Section 13) ---
@@ -378,10 +382,53 @@ async def get_scan_report_csv(
     )
 
 
+def build_llm_provider(settings: Settings) -> LLMProvider | None:
+    """The one place an `LLMProvider` is constructed (Section 17's provider
+    abstraction) — returns `None` when no `LLM_API_KEY` is configured, which
+    `app.ai.analyst.answer_question` treats as "use the fallback message",
+    not as an error. Swapping providers touches only this function."""
+    if not settings.llm_api_key:
+        return None
+    return AnthropicProvider(api_key=settings.llm_api_key, model=settings.llm_model)
+
+
+def answer_scan_question(
+    token: str, question: str, storage: ObjectStorage, settings: Settings
+) -> AskResponse:
+    """The actual ask-a-question work, independent of any web framework —
+    mirrors `execute_scan`'s (M6) pattern. `POST /api/scans/{token}/ask`
+    (JSON API) and `app.web.routes`'s Ask box (M7) both call this directly,
+    so the two front ends can never answer a question differently
+    (Decision Log).
+
+    AI-disabled enforcement, provider selection, and the grounding/fallback
+    behavior all live in `app.ai.analyst.answer_question` — this function's
+    only job is to load the scan, 404 on an unknown token, and translate
+    the result into `AskResponse`. Rate limiting (Section 18: 20/scan,
+    60/hour/IP) is explicitly deferred to M8 (module docstring).
+    """
+    record = load_scan_record(storage, token)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown scan token.")
+
+    certificates = group_into_certificates(record)
+    apply_risk_engine(certificates)
+    provider = build_llm_provider(settings)
+    answer_text, citations = answer_question(record, certificates, question, provider)
+    return AskResponse(answer=answer_text, citations=citations)
+
+
 @router.post("/{token}/ask", response_model=AskResponse)
-def ask_certwatch(token: str, request: AskRequest) -> AskResponse:
-    """Owned by M7 (AI analyst layer). Subject to Section 18 rate limits when wired."""
-    raise _not_implemented("M7")
+def ask_certwatch(
+    token: str,
+    request: AskRequest,
+    storage: ObjectStorage = Depends(get_object_storage),
+    settings: Settings = Depends(get_settings),
+) -> AskResponse:
+    """Section 13/16: `POST /api/scans/{token}/ask`. See
+    `answer_scan_question` for the actual work. Subject to Section 18 rate
+    limits once M8 implements them."""
+    return answer_scan_question(token, request.question, storage, settings)
 
 
 @router.patch("/{token}/ai-preference", response_model=AiPreferenceResponse)

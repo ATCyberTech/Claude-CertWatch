@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     ask_rate_limit_per_scan: int = Field(default=20, alias="ASK_RATE_LIMIT_PER_SCAN")
     ask_rate_limit_per_ip_per_hour: int = Field(default=60, alias="ASK_RATE_LIMIT_PER_IP_PER_HOUR")
     llm_api_key: str | None = Field(default=None, alias="LLM_API_KEY")
+    # Provider selection (Section 28 open decision #3, resolved as an M7
+    # implementation decision, recorded in the Decision Log): Anthropic's
+    # Messages API, behind app.ai.llm_client.LLMProvider so it can be swapped
+    # without rewriting app.ai.analyst or the /ask route.
+    llm_model: str = Field(default="claude-sonnet-4-5-20250929", alias="LLM_MODEL")
     ai_enabled_by_default: bool = Field(default=True, alias="AI_ENABLED_BY_DEFAULT")
 
     # --- Data retention (Section 21, Section 28 open decision #5) ---

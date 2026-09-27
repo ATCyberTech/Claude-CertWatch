@@ -238,20 +238,23 @@ def test_ai_preference_toggle_unknown_token_is_404(client):
     assert response.status_code == 404
 
 
-# --- POST /scans/{token}/ask (the M7-stubbed question box) ---
+# --- POST /scans/{token}/ask (M7: real AI layer, no LLM_API_KEY in tests) ---
 
 
-def test_ask_shows_not_available_notice(client, monkeypatch):
+def test_ask_shows_fallback_message_inline(client, monkeypatch):
+    """No `LLM_API_KEY` is configured in the test `Settings` fixture, so
+    `build_llm_provider` returns `None` and `app.ai.analyst.answer_question`
+    returns its fallback message — this is the real M7 code path, not a
+    stub. The page renders that answer inline (200), rather than
+    redirecting the way the old M6 placeholder notice did."""
     monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
     submit = client.post("/scan", data={"hosts_text": "a.com"})
     token = submit.headers["location"].removeprefix("/scans/")
 
     ask = client.post(f"/scans/{token}/ask", data={"question": "What expires soonest?"})
-    assert ask.status_code == 303
-    assert "ai_ask_unavailable=1" in ask.headers["location"]
-
-    page = client.get(ask.headers["location"])
-    assert "aren't available yet" in page.text
+    assert ask.status_code == 200
+    assert "What expires soonest?" in ask.text
+    assert "isn&#39;t available" in ask.text or "isn't available" in ask.text
 
 
 def test_ask_unknown_token_is_404(client):

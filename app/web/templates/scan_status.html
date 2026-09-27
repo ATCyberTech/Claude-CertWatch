@@ -108,13 +108,20 @@
       </label>
     </form>
   </div>
-  {% if ai_ask_unavailable %}
-  <p class="notice">AI answers aren't available yet — the AI analyst layer is a later milestone (M7). The report, findings, and exports above are already complete without it.</p>
+  {% if ask_question %}
+  <p class="meta"><strong>Q:</strong> {{ ask_question }}</p>
+  <p class="notice">{{ ask_answer }}</p>
+  {% if ask_citations %}
+  <p class="meta">Cited: {% for name in ask_citations %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+  {% endif %}
   {% endif %}
   <form class="ask-box" method="post" action="/scans/{{ record.token }}/ask">
     <textarea name="question" rows="2" placeholder="Ask a question about these findings…" {{ "disabled" if not record.ai_enabled }}></textarea>
     <button type="submit" {{ "disabled" if not record.ai_enabled }}>Ask</button>
   </form>
+  {% if not record.ai_enabled %}
+  <p class="notice">AI features are turned off for this scan — the report, findings, and exports above are already complete without them.</p>
+  {% endif %}
 
   <h2>Report / export</h2>
   <div class="actions">

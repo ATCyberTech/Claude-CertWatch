@@ -379,3 +379,143 @@ def test_report_csv_never_persisted_to_storage(client, monkeypatch, tmp_path):
 
     storage = LocalFilesystemStorage(tmp_path)
     assert storage.get(f"scans/{token}/report.csv") is None
+
+
+# --- POST /api/scans/{token}/ask (M7: AI analyst layer) ---
+#
+# No `LLM_API_KEY` is set in these tests' `Settings`, so `build_llm_provider`
+# returns `None` and every one of these exercises the real
+# `answer_scan_question` -> `app.ai.analyst.answer_question` code path, not a
+# stub — the fallback path is exactly what a user with no key configured
+# gets. `FakeLLMProvider` (below) stands in for a real `LLMProvider` to
+# exercise the grounded/ungrounded/unavailable branches without a network
+# call, via `build_llm_provider` monkeypatched per-test.
+
+
+class FakeLLMProvider:
+    """A minimal `LLMProvider` for tests — never touches the network."""
+
+    def __init__(self, response, raises: Exception | None = None) -> None:
+        self._response = response
+        self._raises = raises
+        self.calls: list[str] = []
+
+    def ask(self, question, scan_token, tools):
+        self.calls.append(question)
+        if self._raises is not None:
+            raise self._raises
+        return self._response
+
+
+def test_ask_unknown_token_is_404(client):
+    response = client.post("/api/scans/never-issued/ask", json={"question": "test?"})
+    assert response.status_code == 404
+
+
+def test_ask_with_no_configured_provider_returns_fallback(client, monkeypatch):
+    """The default test `Settings` has no `LLM_API_KEY` — this is the same
+    fallback a real user with no key configured sees; there is no LLM call
+    to fake here at all."""
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    response = client.post(f"/api/scans/{token}/ask", json={"question": "What expires soonest?"})
+    assert response.status_code == 200
+    body = response.json()
+    assert "already complete" in body["answer"]
+    assert body["citations"] == []
+
+
+def test_ask_disabled_for_scan_skips_provider_entirely(client, monkeypatch):
+    """Section 16's central guarantee: when `scan.ai_enabled` is False, the
+    provider is never constructed or called, even if one is configured."""
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+    client.patch(f"/api/scans/{token}/ai-preference", json={"ai_enabled": False})
+
+    fake = FakeLLMProvider(response=None)
+    monkeypatch.setattr(routes_scans, "build_llm_provider", lambda settings: fake)
+
+    response = client.post(f"/api/scans/{token}/ask", json={"question": "Anything critical?"})
+    assert response.status_code == 200
+    assert "already complete" in response.json()["answer"]
+    assert fake.calls == []
+
+
+def test_ask_provider_unavailable_returns_fallback(client, monkeypatch):
+    from app.ai.llm_client import LLMUnavailableError
+
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    fake = FakeLLMProvider(response=None, raises=LLMUnavailableError("boom"))
+    monkeypatch.setattr(routes_scans, "build_llm_provider", lambda settings: fake)
+
+    response = client.post(f"/api/scans/{token}/ask", json={"question": "Anything critical?"})
+    assert response.status_code == 200
+    assert "already complete" in response.json()["answer"]
+    assert fake.calls == ["Anything critical?"]
+
+
+def test_ask_ungrounded_answer_falls_back(client, monkeypatch):
+    """An answer naming a host the model never saw in a tool result must be
+    rejected, not returned to the user (Section 16's grounding/citation
+    check)."""
+    from app.ai.llm_client import GroundedAnswer
+
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    ungrounded = GroundedAnswer(text="Everything looks fine at totally-invented-host.net.")
+    fake = FakeLLMProvider(response=ungrounded)
+    monkeypatch.setattr(routes_scans, "build_llm_provider", lambda settings: fake)
+
+    response = client.post(f"/api/scans/{token}/ask", json={"question": "Anything critical?"})
+    assert response.status_code == 200
+    assert "already complete" in response.json()["answer"]
+
+
+def test_ask_grounded_answer_returns_real_text_and_citations(client, monkeypatch):
+    from app.ai.llm_client import GroundedAnswer, ToolCallResult
+
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    # The answer is "grounded" because it only names a certificate/host that
+    # actually appeared in a tool result the (fake) model received.
+    tool_call = ToolCallResult(
+        tool_name="get_findings",
+        arguments={},
+        result={"findings": [{"subject_cn": "example.com", "san_list": [], "endpoints": []}]},
+    )
+    grounded = GroundedAnswer(
+        text="example.com looks healthy, expiring in 365 days.",
+        tool_calls=[tool_call],
+    )
+    fake = FakeLLMProvider(response=grounded)
+    monkeypatch.setattr(routes_scans, "build_llm_provider", lambda settings: fake)
+
+    response = client.post(f"/api/scans/{token}/ask", json={"question": "How's example.com?"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "example.com looks healthy, expiring in 365 days."
+    assert "example.com" in body["citations"]
+    assert fake.calls == ["How's example.com?"]
+
+
+def test_build_llm_provider_returns_none_without_api_key():
+    settings = _test_settings()
+    assert routes_scans.build_llm_provider(settings) is None
+
+
+def test_build_llm_provider_constructs_anthropic_provider_with_key():
+    from app.ai.llm_client import AnthropicProvider
+
+    settings = _test_settings(LLM_API_KEY="sk-test-key", LLM_MODEL="claude-test-model")
+    provider = routes_scans.build_llm_provider(settings)
+    assert isinstance(provider, AnthropicProvider)

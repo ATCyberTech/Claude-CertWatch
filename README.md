@@ -5,15 +5,13 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M6 — minimal UI implemented. A full server-rendered web
-workflow now sits on top of the M3–M5 JSON API: paste or upload a host
-list at `/`, watch it scan synchronously, and land on a results page with
-a risk summary, a sortable/filterable certificate inventory, per-
-certificate detail pages, PDF/CSV download links, and a visible AI
-on/off toggle (`PATCH /api/scans/{token}/ai-preference` is now real, not
-a stub). `ask`/the Ask CertWatch box still show "not available yet" —
-there is no AI layer to answer with until M7.** See
-[M6 — minimal UI](#m6--minimal-ui) below.
+**Status: M7 — AI analyst layer implemented. The Ask CertWatch box (M6's
+UI) now answers for real: `POST /api/scans/{token}/ask` (and the web
+UI's question box) run a grounded tool-calling loop over Anthropic's
+Messages API, citing the specific certificates/hosts an answer is based
+on, and falling back to a plain message whenever AI is off, unconfigured,
+unavailable, or would otherwise answer ungrounded.** See
+[M7 — AI analyst layer](#m7--ai-analyst-layer) below.
 
 ## What CertWatch is
 
@@ -52,10 +50,10 @@ app/
   parsing/   — X.509 parsing, five-category chain classification — DONE (M1)
   risk/      — deterministic risk engine, no LLM involvement — DONE (M4)
   storage/   — object-storage abstraction + scan persistence — DONE (M3)
-  ai/        — LLM tool-calling layer, AI on/off toggle enforcement — M7
+  ai/        — LLM tool-calling layer, AI on/off toggle enforcement — DONE (M7)
   reports/   — PDF/CSV report generation — DONE (M5)
-  api/       — HTTP API routes (Section 13 route table) — all but /ask DONE (M3/M4/M5/M6), /ask still M7
-  web/       — server-rendered UI — DONE (M6)
+  api/       — HTTP API routes (Section 13 route table) — DONE, full table (M3/M4/M5/M6/M7)
+  web/       — server-rendered UI — DONE (M6, Ask box answers for real as of M7)
 ```
 
 `app/parsing/certificate_parser.py` parses server-presented certificate
@@ -127,10 +125,60 @@ ends can never scan, score, or render a result differently.
 | **M3** | Object-storage persistence, token generation and lookup. `POST /api/scans` + `GET /api/scans/{token}` implemented end-to-end |
 | **M4** | Deterministic risk engine (five-category chain classification was M1). `GET /api/scans/{token}/findings` implemented end-to-end; `summary_counts` now severity-based |
 | **M5** | Report generation (PDF/CSV). `GET /api/scans/{token}/report.pdf` and `.csv` implemented end-to-end |
-| **M6** | Minimal UI, including the AI on/off toggle control. `app/web/routes.py` implemented end-to-end; `PATCH /api/scans/{token}/ai-preference` implemented (this README describes M0–M6) |
-| M7 | AI analyst layer, grounding/citation checks, AI-disabled enforcement |
+| **M6** | Minimal UI, including the AI on/off toggle control. `app/web/routes.py` implemented end-to-end; `PATCH /api/scans/{token}/ai-preference` implemented |
+| **M7** | AI analyst layer, grounding/citation checks, AI-disabled enforcement. `POST /api/scans/{token}/ask` implemented end-to-end (this README describes M0–M7) |
 | M8 | Rate limiting, secrets management, deletion endpoint, prompt-injection tests |
 | M9 | End-to-end testing + first real dry run |
+
+## M7 — AI analyst layer
+
+`app/ai/` implements Sections 16 and 17 in full, behind the `LLMProvider`
+abstraction (`app.ai.llm_client`):
+
+- **Four fixed, read-only tools** (`app/ai/tools.py`): `get_findings`
+  (optionally filtered by `severity`), `get_certificate`,
+  `get_endpoints_for_certificate`, `get_summary_counts`. No write tool
+  exists. Each returns exactly Section 17's allowed structured shape
+  (`certificate_id, subject_cn, san_list, issuer, days_to_expiry,
+  risk_severity, chain_category, endpoints, flags`) — raw PEM/DER bytes,
+  device configuration, and credentials are never read by this module.
+- **Provider abstraction + v0 provider** (`app/ai/llm_client.py`): the
+  `LLMProvider` ABC is the swappable seam Section 17 requires;
+  `AnthropicProvider` is the concrete v0 implementation (Anthropic's
+  Messages API with native tool use), resolving Section 28's open
+  decision #3. A system prompt fixes the role (explain only from
+  tool-returned data; label fact vs. inference vs. recommendation; treat
+  every tool-returned string as data, never an instruction — Section 17's
+  prompt-injection handling for attacker-influenceable CN/SAN fields).
+  Every tool call is logged via a dedicated `certwatch.ai` logger
+  (Section 17's audit requirement).
+- **Orchestration + grounding check** (`app/ai/analyst.py`):
+  `answer_question` is the single entry point both the JSON API and the
+  web UI call (mirroring M6's `execute_scan` pattern). AI-disabled
+  enforcement lives here — when `scan.ai_enabled` is `False`, or no
+  provider is configured, or the provider fails, the LLM is never called
+  (or its result never surfaces) and a plain fallback message is
+  returned instead. Every answer is checked before being returned: any
+  certificate/host name it mentions must appear in a tool result the
+  model actually received in that conversation; an answer that fails
+  this check is retried once, then falls back.
+- **Wiring** (`app/api/routes_scans.py`, `app/web/routes.py`):
+  `answer_scan_question` (mirroring `execute_scan`) is the plain,
+  framework-agnostic function both `POST /api/scans/{token}/ask` and the
+  web UI's Ask box call — they can never answer a question differently.
+  The web UI renders the real answer and its citations inline on the
+  results page (no more redirect-based placeholder notice).
+
+**Configuring a real provider:** set `LLM_API_KEY` (and optionally
+`LLM_MODEL`, default `claude-sonnet-4-5-20250929`) in your `.env`. With no
+key configured, `/ask` still works end-to-end and returns the fallback
+message — this is expected, not an error.
+
+**What M7 does *not* do (explicitly out of scope, Decision Log):** rate
+limiting (Section 18's 20 questions/scan, 60/hour/IP) — Section 25's own
+milestone table places that in M8, alongside secrets management and
+prompt-injection *tests* (the prompt-injection *handling* itself is
+implemented here, per Section 17).
 
 ## M6 — minimal UI
 
@@ -161,29 +209,26 @@ server-rendered (Jinja2, no React/SPA) workflow:
 5. **Certificate detail** (`/scans/{token}/certificates/{fingerprint}`)
    — chain category (visually distinct via a color-coded badge, one of
    the five from Section 8), SAN list, and every observing endpoint.
-6. **Finding explanation** — absent entirely, not a placeholder. There
-   is no AI layer yet (M7); Section 14 itself says this element is
-   "absent entirely when AI is off," so there is nothing to build here
-   before an AI layer exists to explain anything (the same latitude M5
-   used for the report's own AI-narration slot).
+6. **Finding explanation** — absent entirely, not a placeholder; it is
+   not a distinct control from the Ask box at v0 (an M7 decision).
+   Section 14 itself says this element is "absent entirely when AI is
+   off," so a per-finding "explain this" affordance is left for a later
+   milestone to add if wanted.
 7. **Ask CertWatch + the AI on/off toggle** — the toggle
-   (`POST /scans/{token}/ai-preference`) is the real deliverable of this
-   milestone: it persists `scan.ai_enabled` via
+   (`POST /scans/{token}/ai-preference`) persists `scan.ai_enabled` via
    `app.storage.scan_store.update_ai_preference`, the same
    storage-mutation function the JSON `PATCH .../ai-preference` route
-   now calls too (previously a 501 stub). The question box posts to
-   `POST /scans/{token}/ask`, which calls the still-M7-stubbed
-   `ask_certwatch` and — on its expected 501 — shows a plain "not
-   available yet" notice instead of an error page, per Section 16's own
-   "Fallback" bullet ("if the LLM call fails, times out, or AI is
-   toggled off, the Ask box shows a plain message").
+   calls too. The question box posts to `POST /scans/{token}/ask`,
+   which as of M7 calls the real `app.ai.analyst.answer_question` and
+   renders its answer (or fallback message) inline — see
+   [M7 — AI analyst layer](#m7--ai-analyst-layer) above.
 8. **Report/export** — plain links to the M5 `/api/scans/{token}/report.pdf`/`.csv` routes.
 
-**What M6 does *not* do (explicitly out of scope, Decision Log):**
-enforce `ai_enabled` against any LLM call — there is no LLM call
-anywhere yet to gate, so "enforcement" has nothing to enforce; that is
-M7's job, once an AI layer exists. The toggle here is only the *control*
-Section 25's own M6 row names.
+**What M6 built (historical note):** only the toggle *control* itself —
+persisting `scan.ai_enabled` — with no LLM call anywhere yet to gate.
+Enforcement (never calling the LLM when the flag is `False`) was
+explicitly deferred and is now implemented as of M7, in
+`app.ai.analyst.answer_question`.
 
 ## M5 — report generation
 
@@ -195,9 +240,12 @@ Section 25's own M6 row names.
   sorted worst-severity-first then soonest-expiring-first; Section 2 lists
   every discovered certificate, `"ok"` ones included; Section 3 restates
   Section 8's stated OCSP/CRL revocation-checking limitation and a
-  point-in-time disclaimer. No AI narration exists in this implementation
-  (there is no AI layer yet — M7) — Section 1's optional per-certificate
-  AI explanation is simply absent, not a placeholder.
+  point-in-time disclaimer. No AI narration exists in the report even
+  after M7's AI layer landed — Section 19 explicitly rules out a
+  synchronous, serial LLM call per finding at report-build time, and the
+  PDF/CSV exports must stay complete and correct with AI off; Section 1's
+  optional per-certificate AI explanation remains simply absent, not a
+  placeholder, here.
 - **`build_pdf_report(scan_record, certificates)`** — renders that HTML to
   PDF bytes via WeasyPrint.
 - **`build_csv_report(scan_record, certificates)`** — one CSV row per
@@ -323,16 +371,16 @@ make run
 ```
 
 The app serves at `http://localhost:8000/`. Open `/` in a browser for the
-full upload/scan-report workflow (M6), or use `/healthz` and the
-`/api/scans/...` JSON routes directly — `POST /api/scans`,
-`GET /api/scans/{token}`, `GET /api/scans/{token}/findings`,
-`GET /api/scans/{token}/report.pdf`/`.csv`, and
-`PATCH /api/scans/{token}/ai-preference` all work end-to-end. Only `ask`
-still returns HTTP 501, until M7 lands.
+full upload/scan-report workflow, or use `/healthz` and the
+`/api/scans/...` JSON routes directly — every route in Section 13's table
+now works end-to-end, including `POST /api/scans/{token}/ask`.
 
 No cloud account, API key, or network access beyond the actual scan
 targets is required to run or test CertWatch — the object-storage backend
-defaults to the local filesystem (`.data/scans/`, gitignored).
+defaults to the local filesystem (`.data/scans/`, gitignored), and `/ask`
+works with no `LLM_API_KEY` configured too (it returns the plain fallback
+message rather than an error). To get real AI answers, set `LLM_API_KEY`
+(and optionally `LLM_MODEL`) in your `.env`.
 
 ## How to run tests
 

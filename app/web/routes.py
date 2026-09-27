@@ -17,23 +17,26 @@ Section 14's eight UI elements, and where each lives:
                                     `?sort=` / `?severity=` query params — plain links,
                                     no JS, consistent with "no React/SPA")
   5. Certificate detail            -> `certificate_detail_page`
-  6. Finding explanation (AI)       -> absent entirely — no AI layer exists yet (M7);
-                                    Section 14 itself says this is "absent entirely
-                                    when AI is off," so omitting it before AI even
-                                    exists needs no placeholder (same latitude M5
-                                    used for the report's AI-narration slot).
+  6. Finding explanation (AI)       -> absent entirely — Section 14 itself says this
+                                    element is "absent entirely when AI is off," and
+                                    it is not a distinct control from the Ask box at
+                                    v0 (recorded as an M7 decision); a per-finding
+                                    "explain this" affordance is left for a later
+                                    milestone to add if wanted.
   7. Ask CertWatch + AI toggle       -> `scan_status_page` renders both; the toggle
-                                    posts to `toggle_ai_preference_web`, the question
-                                    box posts to `ask_certwatch_web` (which calls the
-                                    still-M7-stubbed `ask_certwatch` and shows a plain
-                                    "not available yet" notice on the expected 501,
-                                    per Section 16's own "Fallback" bullet).
+                                    posts to `toggle_ai_preference_web`. The question
+                                    box posts to `ask_certwatch_web` (M7), which calls
+                                    the real `app.api.routes_scans.answer_scan_question`
+                                    and re-renders this same page with the answer (or
+                                    the fallback message) inline — no redirect, since
+                                    the answer varies per question and can't be
+                                    round-tripped through a query-string flag the way
+                                    M6's placeholder notice was.
   8. Report/export                  -> plain links to the M5 `.../report.pdf`/`.csv` routes.
 """
 
 from __future__ import annotations
 
-import contextlib
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -42,12 +45,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from starlette.responses import Response
 
-from app.api.routes_scans import (
-    AskRequest,
-    ScanSubmitRequest,
-    ask_certwatch,
-    execute_scan,
-)
+from app.api.routes_scans import ScanSubmitRequest, answer_scan_question, execute_scan
 from app.core.config import Settings, get_settings
 from app.parsing.models import Certificate
 from app.risk.risk_engine import (
@@ -159,25 +157,19 @@ def _load_certificates(
     return record, certificates
 
 
-@router.get("/scans/{token}")
-async def scan_status_page(
-    request: Request,
-    token: str,
-    sort: str = _DEFAULT_SORT,
-    severity: str | None = None,
-    ai_ask_unavailable: bool = False,
-    storage: ObjectStorage = Depends(get_object_storage),
-) -> Response:
-    """Section 14 elements 2, 3, 4, 7, 8: status, risk summary, the
-    sortable/filterable certificate inventory, the Ask box + AI toggle, and
-    the report download links, all on one page."""
-    loaded = _load_certificates(storage, token)
-    if loaded is None:
-        return _templates.TemplateResponse(
-            request, "not_found.html", {"token": token}, status_code=404
-        )
-    record, certificates = loaded
-
+def _build_scan_page_context(
+    record: ScanRecord,
+    certificates: list[Certificate],
+    sort: str,
+    severity: str | None,
+    ask_question: str | None = None,
+    ask_answer: str | None = None,
+    ask_citations: list[str] | None = None,
+) -> dict[str, object]:
+    """Shared template context for `scan_status.html` — built once here so
+    both `scan_status_page` (GET, no question yet) and `ask_certwatch_web`
+    (POST, rendering the page with a real answer inline — M7) stay in sync
+    on the risk summary / inventory / sort / filter fields (Decision Log)."""
     all_severities = sorted({c.risk_severity or "ok" for c in certificates})
     inventory = [
         c for c in certificates if severity is None or (c.risk_severity or "ok") == severity
@@ -192,19 +184,41 @@ async def scan_status_page(
         ),
     )[:5]
 
+    return {
+        "record": record,
+        "summary_counts": summarize_risk_severity(record),
+        "top_findings": top_findings,
+        "certificates": inventory,
+        "all_severities": all_severities,
+        "current_sort": sort,
+        "current_severity": severity or "",
+        "ask_question": ask_question,
+        "ask_answer": ask_answer,
+        "ask_citations": ask_citations or [],
+    }
+
+
+@router.get("/scans/{token}")
+async def scan_status_page(
+    request: Request,
+    token: str,
+    sort: str = _DEFAULT_SORT,
+    severity: str | None = None,
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> Response:
+    """Section 14 elements 2, 3, 4, 7, 8: status, risk summary, the
+    sortable/filterable certificate inventory, the Ask box + AI toggle, and
+    the report download links, all on one page."""
+    loaded = _load_certificates(storage, token)
+    if loaded is None:
+        return _templates.TemplateResponse(
+            request, "not_found.html", {"token": token}, status_code=404
+        )
+    record, certificates = loaded
     return _templates.TemplateResponse(
         request,
         "scan_status.html",
-        {
-            "record": record,
-            "summary_counts": summarize_risk_severity(record),
-            "top_findings": top_findings,
-            "certificates": inventory,
-            "all_severities": all_severities,
-            "current_sort": sort,
-            "current_severity": severity or "",
-            "ai_ask_unavailable": ai_ask_unavailable,
-        },
+        _build_scan_page_context(record, certificates, sort, severity),
     )
 
 
@@ -265,17 +279,33 @@ async def ask_certwatch_web(
     token: str,
     question: str = Form(...),
     storage: ObjectStorage = Depends(get_object_storage),
+    settings: Settings = Depends(get_settings),
 ) -> Response:
-    """Section 14 element 7's question box. `ask_certwatch` is still M7's
-    501 stub — no AI layer exists yet — so this calls it, catches that
-    expected failure, and shows a plain notice instead of a raw error page
-    (Section 16's own "Fallback" bullet: "if the LLM call fails, times
-    out, or AI is toggled off, the Ask box shows a plain message")."""
-    record = load_scan_record(storage, token)
-    if record is None:
+    """Section 14 element 7's question box (M7). Calls the same plain
+    `answer_scan_question` function `POST /api/scans/{token}/ask` calls —
+    so the web UI and the JSON API can never answer a question differently
+    (Decision Log) — and re-renders the results page with the real answer
+    (or `app.ai.analyst`'s fallback message, per Section 16's own
+    "Fallback" bullet) inline, rather than redirecting: the answer varies
+    per question, so it can't be round-tripped through a query-string flag
+    the way M6's placeholder notice was."""
+    loaded = _load_certificates(storage, token)
+    if loaded is None:
         return _templates.TemplateResponse(
             request, "not_found.html", {"token": token}, status_code=404
         )
-    with contextlib.suppress(HTTPException):
-        ask_certwatch(token, AskRequest(question=question))
-    return RedirectResponse(url=f"/scans/{token}?ai_ask_unavailable=1", status_code=303)
+    record, certificates = loaded
+    response = answer_scan_question(token, question, storage, settings)
+    return _templates.TemplateResponse(
+        request,
+        "scan_status.html",
+        _build_scan_page_context(
+            record,
+            certificates,
+            _DEFAULT_SORT,
+            None,
+            ask_question=question,
+            ask_answer=response.answer,
+            ask_citations=response.citations,
+        ),
+    )

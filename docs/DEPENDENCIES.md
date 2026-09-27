@@ -22,6 +22,7 @@ of the inline justification comments already present in `pyproject.toml`.
 | `pyopenssl` | §6, §7, Decision Log (M2) | Retrieves the **full** server-presented certificate chain (leaf + intermediates) via OpenSSL's `SSL_get_peer_cert_chain()`. The stdlib `ssl` module has no public API for this in this Python version — `SSLSocket.getpeercert()` returns the leaf only — confirmed by direct introspection (`dir(ssl.SSLSocket)`) before choosing this dependency |
 | `slowapi` | §18 | Per-IP submission and `/ask` rate limiting without standing up a separate service |
 | `weasyprint` | §15 | Server-side HTML→PDF rendering for reports, no separate rendering service. Wired as of M5 (`app.reports.report_builder.build_pdf_report`) |
+| `anthropic` | §16, §17, §28 open decision #3 | The v0 LLM provider's SDK, chosen as the M7 implementation resolving Section 28's open provider-selection decision (Decision Log). Used only behind `app.ai.llm_client.LLMProvider` (Section 17's "Provider abstraction" requirement) — `app.ai.analyst` and the `/ask` route never import it directly, so swapping providers touches only `app/ai/llm_client.py` |
 
 **Deliberately not included:** any cloud SDK (`boto3`, `azure-storage-blob`,
 etc.), still, even after M3. The M2 gate resolved to local Windows dev as
@@ -40,7 +41,10 @@ uses stdlib `csv`, not pandas, and `weasyprint`/`jinja2` were already
 declared dependencies, just not yet wired to anything. No new runtime
 dependency was needed for M6 either — `fastapi`/`jinja2`/`python-multipart`
 were already declared (for exactly this purpose, per their own table
-rows above) and just not yet wired to a real UI.
+rows above) and just not yet wired to a real UI. **M7 adds exactly one
+new runtime dependency, `anthropic`** — no dev/test dependency was needed;
+`FakeLLMProvider`/`_FakeProvider` test doubles implement the same
+`LLMProvider` interface without importing the SDK at all.
 
 ## Dev / test dependencies
 
@@ -200,3 +204,43 @@ rows above) and just not yet wired to a real UI.
   LLM call anywhere yet to gate on the flag, so "enforcement" (never
   calling the LLM when it's `False`) is explicitly left to M7, once an
   AI layer exists to enforce it on.
+- **Anthropic's Messages API is the v0 LLM provider, resolving Section
+  28's open decision #3** (M7 implementation decision, recorded in the
+  Decision Log) — its native tool-use support maps directly onto Section
+  16's "system prompt + tool-calling loop" design; the choice is recorded
+  rather than left open because the provider abstraction (Section 17's
+  own requirement) already makes it swappable later at no cost.
+- **`LLMProvider.ask` takes a `tools: ScanToolExecutor` parameter beyond
+  the M0 stub's `(question, scan_token)`** (M7 implementation decision) —
+  the stub predates the tool-calling design; a provider needs the tool
+  executor bound to *this* scan's data to run its own tool-calling loop.
+- **`ask_certwatch`'s body is factored into a plain `answer_scan_question`
+  function**, called by both the JSON `POST /api/scans/{token}/ask` route
+  and the web UI's Ask box (M7 implementation decision, mirroring M6's
+  `execute_scan` pattern) — so the two front ends can never answer a
+  question differently.
+- **Grounding is a regex-based known-names check, not a second LLM call**
+  (M7 implementation decision) — every certificate_id/subject_cn/SAN/
+  endpoint-host string seen in a tool result the model actually received
+  is collected into a known-names set; any hostname-shaped string in the
+  model's answer that isn't in that set fails the check. This is
+  deterministic and free, versus asking a second LLM call to verify the
+  first (real cost, and itself unverifiable). An answer that fails is
+  retried once (a fresh provider call), then falls back to the plain
+  message — this is "reject and fall back," not "reject and regenerate
+  indefinitely," given the fixed per-question retry budget Section 18's
+  rate limits imply is scarce.
+- **Every LLM tool call is logged via a dedicated `certwatch.ai` logger**
+  (M7 implementation decision, Section 17's audit requirement) — kept
+  separate from ordinary app logs so tool-call audit trails (tool name,
+  scan token) can be reviewed or shipped independently; the question text
+  itself is not logged by this logger (Section 17 says it should be
+  logged for abuse investigation but shown to no one but the scan owner —
+  left for M8's rate-limiting/abuse-investigation work to wire a
+  question-text log sink with its own access controls, rather than
+  building that here with no consumer yet).
+- **Rate limiting (Section 18: 20 questions/scan, 60/hour/IP) is not
+  implemented on `/ask`** (M7 implementation decision) — Section 25's own
+  milestone table lists rate limiting under M8, distinct from M7's
+  "grounding and citation checks, AI-disabled enforcement" scope; this
+  continues the same deferral pattern used for `submit_scan` since M3.

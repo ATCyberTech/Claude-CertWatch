@@ -48,6 +48,13 @@ dependencies = [
 
     # --- Report generation (Section 15 — dependency declared now, wiring deferred to M5) ---
     "weasyprint>=62.0",           # server-side HTML→PDF rendering, no separate rendering service
+
+    # --- AI analyst layer (Section 16, 17, Section 28 open decision #3, M7) ---
+    # anthropic: the chosen v0 LLM provider's SDK, resolving Section 28's open
+    # provider-selection decision (Decision Log). Used only behind
+    # app.ai.llm_client.LLMProvider (Section 17's "Provider abstraction"
+    # requirement) — app.ai.analyst and the /ask route never import it directly.
+    "anthropic>=0.40,<1.0",
 ]
 
 [project.optional-dependencies]
