@@ -5,13 +5,16 @@ monitoring for network/security engineers, consultants, and MSPs — built
 for the CA-agnostic gap at the mid-market/MSP tier that vendor-native
 certificate-lifecycle tools don't cover.
 
-**Status: M7 — AI analyst layer implemented. The Ask CertWatch box (M6's
-UI) now answers for real: `POST /api/scans/{token}/ask` (and the web
-UI's question box) run a grounded tool-calling loop over Anthropic's
-Messages API, citing the specific certificates/hosts an answer is based
-on, and falling back to a plain message whenever AI is off, unconfigured,
-unavailable, or would otherwise answer ungrounded.** See
-[M7 — AI analyst layer](#m7--ai-analyst-layer) below.
+**Status: M8 — rate limiting, secrets management, deletion endpoint, and
+prompt-injection tests implemented. `submit_scan` and `/ask` now enforce
+Section 18's exact numbers (5/hour/IP submissions; 20 questions/scan
+lifetime cap; 60/hour/IP questions); `DELETE /api/scans/{token}` removes
+a scan's stored data on request; a `Referrer-Policy: no-referrer` header
+and scan-token log redaction close a Section 12 gap open since M3; and
+new tests validate that prompt-injection-style certificate content never
+changes model behavior.** See [M8 — rate limiting, secrets
+management, deletion endpoint](#m8--rate-limiting-secrets-management-deletion-endpoint)
+below.
 
 ## What CertWatch is
 
@@ -52,8 +55,8 @@ app/
   storage/   — object-storage abstraction + scan persistence — DONE (M3)
   ai/        — LLM tool-calling layer, AI on/off toggle enforcement — DONE (M7)
   reports/   — PDF/CSV report generation — DONE (M5)
-  api/       — HTTP API routes (Section 13 route table) — DONE, full table (M3/M4/M5/M6/M7)
-  web/       — server-rendered UI — DONE (M6, Ask box answers for real as of M7)
+  api/       — HTTP API routes (Section 13 route table) — DONE, full table (M3/M4/M5/M6/M7/M8)
+  web/       — server-rendered UI — DONE (M6, Ask box answers for real as of M7, rate limiting M8)
 ```
 
 `app/parsing/certificate_parser.py` parses server-presented certificate
@@ -126,9 +129,64 @@ ends can never scan, score, or render a result differently.
 | **M4** | Deterministic risk engine (five-category chain classification was M1). `GET /api/scans/{token}/findings` implemented end-to-end; `summary_counts` now severity-based |
 | **M5** | Report generation (PDF/CSV). `GET /api/scans/{token}/report.pdf` and `.csv` implemented end-to-end |
 | **M6** | Minimal UI, including the AI on/off toggle control. `app/web/routes.py` implemented end-to-end; `PATCH /api/scans/{token}/ai-preference` implemented |
-| **M7** | AI analyst layer, grounding/citation checks, AI-disabled enforcement. `POST /api/scans/{token}/ask` implemented end-to-end (this README describes M0–M7) |
-| M8 | Rate limiting, secrets management, deletion endpoint, prompt-injection tests |
+| **M7** | AI analyst layer, grounding/citation checks, AI-disabled enforcement. `POST /api/scans/{token}/ask` implemented end-to-end |
+| **M8** | Rate limiting (Section 18), secrets management, deletion endpoint, prompt-injection tests. `DELETE /api/scans/{token}` implemented end-to-end (this README describes M0–M8) |
 | M9 | End-to-end testing + first real dry run |
+
+## M8 — rate limiting, secrets management, deletion endpoint
+
+Implements Section 18 in full, closes a Section 12 gap open since M3, and
+adds the deletion endpoint and prompt-injection tests Section 25's M8 row
+names (see `docs/M8_CHECKLIST.md` for the complete requirement mapping).
+
+- **Rate limiting** (`app/api/routes_scans.py`, `app/web/routes.py`):
+  `slowapi` (already a declared dependency since M0, unused until now) is
+  wired up via `app.main.create_app` (`app.state.limiter` +
+  `RateLimitExceeded` exception handler). Section 18's two exact per-IP-
+  hourly numbers are enforced as fixed limit strings —
+  `submit_scan`/`submit_scan_via_web`: 5/hour; `ask_certwatch`/
+  `ask_certwatch_web`: 60/hour/IP — identical on both the JSON API and the
+  web UI, so the two front ends can never enforce differently. The
+  remaining `/api/scans/{token}/*` routes get a generous, explicitly-not-
+  spec-stated 30/minute (defense-in-depth against token brute-forcing,
+  Section 21). Section 18's "/ask: 20/scan" is a **lifetime cap**, not a
+  sliding time window, so it's a persisted `ScanRecord.ask_count` counter
+  (`app.storage.scan_store.increment_ask_count`) instead — checked inside
+  `answer_scan_question` before any AI logic runs, and fully respects the
+  existing `Settings`-injected value (unlike the two `slowapi` limits,
+  which are fixed constants — see the Decision Log for why).
+- **Deletion endpoint** (`DELETE /api/scans/{token}`,
+  `app.storage.scan_store.delete_scan`): removes a scan's persisted
+  `result.json` and `report.pdf`. Sourced from Section 21's security-
+  requirements table, not Section 13's own route table (which has no
+  deletion row) — this is this milestone's addition to it. JSON-API only;
+  Section 14's UI spec names no delete affordance.
+- **Referrer-Policy + log redaction** (`app.main`, `app.core.
+  logging_config`): a `Referrer-Policy: no-referrer` header on every
+  response (Section 12, tagged BUILD NOW since M3 but never actually
+  implemented until now), plus a `logging.Filter`
+  (`RedactTokensFilter`) that redacts scan-token-shaped strings from every
+  logger CertWatch's own code writes through. This does **not** reach
+  uvicorn's own built-in access log — see that module's docstring for the
+  documented, honest scope limit and mitigation.
+- **Prompt-injection tests** (Section 22): `tests/unit/test_ai_tools.py`
+  asserts a certificate whose subject_cn/SAN contains injection-style
+  text (`"IGNORE ALL PREVIOUS INSTRUCTIONS...`) passes through the tool
+  layer completely unmodified, as plain data; `tests/unit/
+  test_llm_client.py` asserts the `system=` parameter sent to the model
+  is byte-identical to the fixed system prompt on every tool-calling-loop
+  iteration, regardless of what the injected CN says — proving the actual
+  guarantee Section 17's handling rests on (tool results never get mixed
+  into instructions), not just that the model "behaves."
+
+**What M8 does *not* do (explicitly out of scope, Decision Log):**
+Section 21's 90-day data-retention default (needs a background expiry
+sweep — no job scheduler exists in this monolith yet; Section 21 itself
+marks it "confirmation pending," not a hard blocker here); a real cloud
+secret manager (no concrete cloud target is stood up yet, same basis as
+the M2 gate decision); reliable redaction of uvicorn's own access log
+(an operational/deployment concern, not something this application
+factory can guarantee from inside itself).
 
 ## M7 — AI analyst layer
 

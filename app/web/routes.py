@@ -33,6 +33,17 @@ Section 14's eight UI elements, and where each lives:
                                     round-tripped through a query-string flag the way
                                     M6's placeholder notice was.
   8. Report/export                  -> plain links to the M5 `.../report.pdf`/`.csv` routes.
+
+M8 note (recorded in the Decision Log): `submit_scan_via_web` (`POST
+/scan`) and `ask_certwatch_web` (`POST /scans/{token}/ask`) now carry the
+identical `@limiter.limit(...)` decorators as their JSON-API counterparts
+(`app.api.routes_scans.submit_scan`/`ask_certwatch`), reusing the same
+`limiter` instance and the same fixed Section 18 limit strings, so the two
+front ends enforce identically and can never disagree about how many
+submissions or questions an IP gets. The per-scan lifetime `/ask` cap
+(enforced inside `answer_scan_question` itself) is caught here and
+rendered inline on the results page rather than propagating as a raw 429
+— see `ask_certwatch_web`'s own docstring.
 """
 
 from __future__ import annotations
@@ -45,7 +56,14 @@ from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from starlette.responses import Response
 
-from app.api.routes_scans import ScanSubmitRequest, answer_scan_question, execute_scan
+from app.api.routes_scans import (
+    _ASK_IP_RATE_LIMIT,
+    _SUBMIT_RATE_LIMIT,
+    ScanSubmitRequest,
+    answer_scan_question,
+    execute_scan,
+    limiter,
+)
 from app.core.config import Settings, get_settings
 from app.parsing.models import Certificate
 from app.risk.risk_engine import (
@@ -90,6 +108,7 @@ def index(request: Request, error: str | None = None, hosts_text: str = "") -> R
 
 
 @router.post("/scan")
+@limiter.limit(_SUBMIT_RATE_LIMIT)
 async def submit_scan_via_web(
     request: Request,
     hosts_text: str = Form(""),
@@ -274,6 +293,7 @@ async def toggle_ai_preference_web(
 
 
 @router.post("/scans/{token}/ask")
+@limiter.limit(_ASK_IP_RATE_LIMIT)
 async def ask_certwatch_web(
     request: Request,
     token: str,
@@ -288,14 +308,41 @@ async def ask_certwatch_web(
     (or `app.ai.analyst`'s fallback message, per Section 16's own
     "Fallback" bullet) inline, rather than redirecting: the answer varies
     per question, so it can't be round-tripped through a query-string flag
-    the way M6's placeholder notice was."""
+    the way M6's placeholder notice was.
+
+    M8: `answer_scan_question` now raises `HTTPException(429)` once this
+    scan's lifetime `/ask` cap (Section 18: 20/scan) is reached. A web-UI
+    visitor gets that rendered back inline on this same page (the answer
+    slot shows the cap message) rather than a raw JSON 429 — the one place
+    this milestone's rate limiting gets a friendlier treatment than the
+    JSON API, since this route is the one a human is actually looking at
+    when it fires. The per-IP-hourly cap (the decorator above) is not
+    caught here: an exceeded route-level limit raises `RateLimitExceeded`,
+    handled globally by `app.main`'s registered handler, the same way it is
+    for every other rate-limited route in this app (Decision Log)."""
     loaded = _load_certificates(storage, token)
     if loaded is None:
         return _templates.TemplateResponse(
             request, "not_found.html", {"token": token}, status_code=404
         )
     record, certificates = loaded
-    response = answer_scan_question(token, question, storage, settings)
+    try:
+        response = answer_scan_question(token, question, storage, settings)
+    except HTTPException as exc:
+        return _templates.TemplateResponse(
+            request,
+            "scan_status.html",
+            _build_scan_page_context(
+                record,
+                certificates,
+                _DEFAULT_SORT,
+                None,
+                ask_question=question,
+                ask_answer=str(exc.detail),
+                ask_citations=[],
+            ),
+            status_code=exc.status_code,
+        )
     return _templates.TemplateResponse(
         request,
         "scan_status.html",

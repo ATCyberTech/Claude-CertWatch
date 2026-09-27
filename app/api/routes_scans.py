@@ -2,8 +2,33 @@
 
 `submit_scan`, `get_scan_status` (M3), `get_scan_findings` (M4),
 `get_scan_report_pdf`/`get_scan_report_csv` (M5), `set_ai_preference` (M6,
-the toggle control itself), and `ask_certwatch` (M7, the AI analyst layer)
-are all implemented.
+the toggle control itself), `ask_certwatch` (M7, the AI analyst layer),
+and `delete_scan` (M8) are all implemented, and rate limiting (Section 18)
+now applies across the table.
+
+Rate-limiting note (M8 implementation decision, recorded in the Decision
+Log): the two per-IP, per-hour limits Section 18 states exact numbers for
+(`submit_scan`: 5/hour; `ask_certwatch`: 60/hour) are enforced with
+`slowapi`, as fixed limit strings (`_SUBMIT_RATE_LIMIT`,
+`_ASK_IP_RATE_LIMIT`) matching those numbers — slowapi's decorators are
+applied at module-import time, before any per-request `Settings` exists,
+so they cannot consult a `Depends`-resolved or test-overridden `Settings`
+instance the way every other value in this module does; changing the
+enforced number requires a code change to these constants, not just an
+env var (the `SUBMIT_RATE_LIMIT_PER_IP_PER_HOUR`/
+`ASK_RATE_LIMIT_PER_IP_PER_HOUR` config fields remain declared for
+Section 24 parity/documentation, but are not consulted at enforcement
+time). Section 18's "/ask: 20/scan" is a lifetime cap on one scan, not a
+sliding time window, so it cannot be a slowapi limit at all — it is a
+persisted `ScanRecord.ask_count` counter (`app.storage.scan_store.
+increment_ask_count`), checked and incremented inside
+`answer_scan_question` itself, and *does* fully respect the
+`Settings`-injected `ask_rate_limit_per_scan` value like everything else.
+The remaining `/api/scans/{token}/*` routes (status, findings, the two
+report exports, ai-preference) carry no exact number in Section 18, so a
+generous, documented `_TOKEN_ROUTE_LIMIT` ("30/minute") is applied to all
+of them — defense-in-depth against token brute-forcing per Section 21's
+"Rate-limited access" control, not a number the spec states explicitly.
 
 AI-analyst note (M7 implementation decision, recorded in the Decision
 Log): `ask_certwatch`'s body is factored into a plain `answer_scan_question`
@@ -44,9 +69,13 @@ implementation existed (a dev-only scenario — there is no real production
 data yet). The CSV export is never persisted (Section 11 lists no CSV
 storage key) and is always generated fresh per request.
 
-Rate limiting (Section 13's "5 submissions/hour/IP", "20 questions/scan;
-60/hour/IP") is explicitly M8's job (Section 18) and is NOT implemented
-here yet — `submit_scan` currently has no request-rate limit of its own.
+Deletion-endpoint note (M8 implementation decision, recorded in the
+Decision Log): Section 13's own route table has no deletion row, but
+Section 21's security-requirements table independently states "Deletion
+endpoint removing the object-storage blob on request" as its own BUILD
+NOW item — `DELETE /api/scans/{token}` is this milestone's addition to
+Section 13, not a pre-existing spec route. It is JSON-API only; Section
+14's UI spec lists no delete affordance, so no web-UI button is added.
 
 Port-assignment note (M3 implementation clarification, recorded in the
 Decision Log): Section 13 describes `ports` only as "optional per-host
@@ -69,6 +98,8 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, model_validator
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from app.ai.analyst import answer_question
 from app.ai.llm_client import AnthropicProvider, LLMProvider
@@ -86,9 +117,12 @@ from app.scanning.scanner import scan_hosts
 from app.storage import get_object_storage
 from app.storage.interface import ObjectStorage
 from app.storage.scan_store import (
+    AskLimitExceededError,
     ScanRecord,
+    delete_scan,
     generate_scan_token,
     host_outcome_to_record,
+    increment_ask_count,
     load_scan_record,
     report_storage_key,
     save_scan_record,
@@ -98,6 +132,21 @@ from app.storage.scan_store import (
 router = APIRouter(prefix="/api/scans", tags=["scans"])
 
 _DEFAULT_SCAN_PORT = 443
+
+# Section 18's two exact per-IP-hourly numbers (see the module docstring's
+# rate-limiting note for why these are fixed strings, not read from
+# `Settings`). `limiter` is a MODULE-LEVEL singleton — this module is
+# imported once per process, so its in-memory rate-limit storage is shared
+# and accumulates across every test in a single pytest run (Starlette's
+# `TestClient` uses one consistent fake IP for all requests). Test
+# isolation is achieved by calling `limiter.reset()` in the `client`
+# fixtures (`tests/conftest.py`, and the local fixtures in
+# `tests/unit/test_routes_scans.py`/`test_web_routes.py`) before each
+# test, not by any per-`create_app()`-call isolation — there is none.
+limiter = Limiter(key_func=get_remote_address)
+_SUBMIT_RATE_LIMIT = "5/hour"
+_ASK_IP_RATE_LIMIT = "60/hour"
+_TOKEN_ROUTE_LIMIT = "30/minute"
 
 
 # --- Request/response models (Section 13) ---
@@ -237,6 +286,7 @@ async def execute_scan(
 
 
 @router.post("", response_model=ScanSubmitResponse, status_code=201)
+@limiter.limit(_SUBMIT_RATE_LIMIT)
 async def submit_scan(
     payload: ScanSubmitRequest,
     request: Request,
@@ -252,8 +302,9 @@ async def submit_scan(
 
 
 @router.get("/{token}", response_model=ScanStatusResponse)
+@limiter.limit(_TOKEN_ROUTE_LIMIT)
 async def get_scan_status(
-    token: str, storage: ObjectStorage = Depends(get_object_storage)
+    request: Request, token: str, storage: ObjectStorage = Depends(get_object_storage)
 ) -> ScanStatusResponse:
     """Section 13: `GET /api/scans/{token}`. Token is the sole access
     control (Section 12) — there is no other authorization check.
@@ -298,7 +349,9 @@ def _finding_from_certificate(
 
 
 @router.get("/{token}/findings", response_model=FindingsPageResponse)
+@limiter.limit(_TOKEN_ROUTE_LIMIT)
 async def get_scan_findings(
+    request: Request,
     token: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(_DEFAULT_FINDINGS_PAGE_SIZE, ge=1, le=_MAX_FINDINGS_PAGE_SIZE),
@@ -330,8 +383,9 @@ async def get_scan_findings(
 
 
 @router.get("/{token}/report.pdf")
+@limiter.limit(_TOKEN_ROUTE_LIMIT)
 async def get_scan_report_pdf(
-    token: str, storage: ObjectStorage = Depends(get_object_storage)
+    request: Request, token: str, storage: ObjectStorage = Depends(get_object_storage)
 ) -> Response:
     """Section 13/15: `GET /api/scans/{token}/report.pdf`.
 
@@ -358,8 +412,9 @@ async def get_scan_report_pdf(
 
 
 @router.get("/{token}/report.csv")
+@limiter.limit(_TOKEN_ROUTE_LIMIT)
 async def get_scan_report_csv(
-    token: str, storage: ObjectStorage = Depends(get_object_storage)
+    request: Request, token: str, storage: ObjectStorage = Depends(get_object_storage)
 ) -> Response:
     """Section 13/15: `GET /api/scans/{token}/report.csv`.
 
@@ -401,13 +456,23 @@ def answer_scan_question(
     so the two front ends can never answer a question differently
     (Decision Log).
 
+    Section 18's lifetime "/ask: 20/scan" cap is enforced here, via
+    `increment_ask_count`, before any AI logic runs — every accepted call
+    counts against it, even one that ends up answering with the plain
+    fallback message, since the cap protects the endpoint itself from
+    volume (Decision Log). The per-IP-hourly "/ask: 60/hour" number is a
+    separate concern, enforced by `slowapi` at the route level (both the
+    JSON route and the web UI's own `/scans/{token}/ask` route), not here.
+
     AI-disabled enforcement, provider selection, and the grounding/fallback
     behavior all live in `app.ai.analyst.answer_question` — this function's
-    only job is to load the scan, 404 on an unknown token, and translate
-    the result into `AskResponse`. Rate limiting (Section 18: 20/scan,
-    60/hour/IP) is explicitly deferred to M8 (module docstring).
+    only other job is to load the scan, 404 on an unknown token, and
+    translate the result into `AskResponse`.
     """
-    record = load_scan_record(storage, token)
+    try:
+        record = increment_ask_count(storage, token, settings.ask_rate_limit_per_scan)
+    except AskLimitExceededError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown scan token.")
 
@@ -419,30 +484,55 @@ def answer_scan_question(
 
 
 @router.post("/{token}/ask", response_model=AskResponse)
+@limiter.limit(_ASK_IP_RATE_LIMIT)
 def ask_certwatch(
+    request: Request,
     token: str,
-    request: AskRequest,
+    payload: AskRequest,
     storage: ObjectStorage = Depends(get_object_storage),
     settings: Settings = Depends(get_settings),
 ) -> AskResponse:
     """Section 13/16: `POST /api/scans/{token}/ask`. See
-    `answer_scan_question` for the actual work. Subject to Section 18 rate
-    limits once M8 implements them."""
-    return answer_scan_question(token, request.question, storage, settings)
+    `answer_scan_question` for the actual work — including Section 18's
+    per-scan cap. The per-IP-hourly cap is this decorator."""
+    return answer_scan_question(token, payload.question, storage, settings)
 
 
 @router.patch("/{token}/ai-preference", response_model=AiPreferenceResponse)
+@limiter.limit(_TOKEN_ROUTE_LIMIT)
 def set_ai_preference(
+    request: Request,
     token: str,
-    request: AiPreferenceRequest,
+    payload: AiPreferenceRequest,
     storage: ObjectStorage = Depends(get_object_storage),
 ) -> AiPreferenceResponse:
     """Section 13/16: `PATCH /api/scans/{token}/ai-preference` — the toggle
     *control* itself, owned by M6. Persists `scan.ai_enabled`
-    (`app.storage.scan_store.update_ai_preference`); does not gate any LLM
-    call on it, since none exists yet — that enforcement is M7's job.
+    (`app.storage.scan_store.update_ai_preference`); enforcement of the
+    flag lives in `app.ai.analyst.answer_question` (M7).
     """
-    record = update_ai_preference(storage, token, request.ai_enabled)
+    record = update_ai_preference(storage, token, payload.ai_enabled)
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown scan token.")
     return AiPreferenceResponse(ai_enabled=record.ai_enabled)
+
+
+@router.delete("/{token}", status_code=204)
+@limiter.limit(_TOKEN_ROUTE_LIMIT)
+def delete_scan_endpoint(
+    request: Request, token: str, storage: ObjectStorage = Depends(get_object_storage)
+) -> Response:
+    """M8 addition to Section 13 (Section 21: "Deletion endpoint removing
+    the object-storage blob on request"). Removes the persisted
+    `result.json` and `report.pdf` for `token`; the CSV export is never
+    persisted, so there is nothing to remove there (see
+    `app.storage.scan_store.delete_scan`'s docstring). 404s on a token
+    that was never a real scan, exactly like every other
+    `/api/scans/{token}/*` route, so this can't be used to distinguish
+    "never existed" from "already deleted" — both read the same to a
+    caller, which is the correct behavior for a token-as-sole-identifier
+    design (Section 12)."""
+    existed = delete_scan(storage, token)
+    if not existed:
+        raise HTTPException(status_code=404, detail="Unknown scan token.")
+    return Response(status_code=204)

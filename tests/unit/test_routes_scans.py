@@ -53,6 +53,10 @@ def _sample_certificate(**overrides) -> Certificate:
 
 @pytest.fixture
 def client(tmp_path) -> Iterator[TestClient]:
+    # M8: reset the module-level rate limiter before each test — see the
+    # comment above `routes_scans.limiter`'s definition and the matching
+    # note in tests/conftest.py's own `client` fixture.
+    routes_scans.limiter.reset()
     app = create_app()
     storage = LocalFilesystemStorage(tmp_path)
     app.dependency_overrides[get_object_storage] = lambda: storage
@@ -519,3 +523,79 @@ def test_build_llm_provider_constructs_anthropic_provider_with_key():
     settings = _test_settings(LLM_API_KEY="sk-test-key", LLM_MODEL="claude-test-model")
     provider = routes_scans.build_llm_provider(settings)
     assert isinstance(provider, AnthropicProvider)
+
+
+# --- M8: rate limiting (Section 18) ---
+
+
+def test_rate_limit_constants_match_section_18_exactly():
+    """Section 18 states these two numbers explicitly; a code change to
+    either constant is the only way to change what's enforced (Decision
+    Log) — this pins them against an accidental edit."""
+    assert routes_scans._SUBMIT_RATE_LIMIT == "5/hour"
+    assert routes_scans._ASK_IP_RATE_LIMIT == "60/hour"
+
+
+def test_submit_scan_sixth_submission_in_one_hour_is_429(client, monkeypatch):
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    for _ in range(5):
+        response = client.post("/api/scans", json={"hosts": ["example.com"]})
+        assert response.status_code == 201
+
+    sixth = client.post("/api/scans", json={"hosts": ["example.com"]})
+    assert sixth.status_code == 429
+
+
+def test_ask_per_scan_lifetime_cap_returns_429_on_the_21st_question(client, monkeypatch):
+    """Section 18: 20 questions/scan is a lifetime cap, not a sliding
+    window — the 21st call on the same scan must be rejected even with no
+    provider configured (every accepted call counts, per the Decision
+    Log), while the per-IP-hourly cap (60/hour) is not implicated since
+    21 < 60."""
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    for _ in range(20):
+        response = client.post(f"/api/scans/{token}/ask", json={"question": "status?"})
+        assert response.status_code == 200
+
+    twenty_first = client.post(f"/api/scans/{token}/ask", json={"question": "status?"})
+    assert twenty_first.status_code == 429
+
+
+def test_response_carries_referrer_policy_header(client):
+    response = client.get("/api/scans/unknown-token")
+    assert response.headers["referrer-policy"] == "no-referrer"
+
+
+# --- M8: DELETE /api/scans/{token} (Section 21's deletion endpoint) ---
+
+
+def test_delete_scan_returns_204_and_removes_the_scan(client, monkeypatch):
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    delete_response = client.delete(f"/api/scans/{token}")
+    assert delete_response.status_code == 204
+
+    status_response = client.get(f"/api/scans/{token}")
+    assert status_response.status_code == 404
+
+
+def test_delete_scan_unknown_token_is_404(client):
+    response = client.delete("/api/scans/does-not-exist")
+    assert response.status_code == 404
+
+
+def test_delete_scan_twice_is_404_the_second_time(client, monkeypatch):
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/api/scans", json={"hosts": ["a.com"]})
+    token = submit.json()["token"]
+
+    first = client.delete(f"/api/scans/{token}")
+    assert first.status_code == 204
+
+    second = client.delete(f"/api/scans/{token}")
+    assert second.status_code == 404

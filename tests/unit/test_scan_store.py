@@ -4,16 +4,22 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from app.parsing.models import Certificate, ChainCategory
 from app.scanning.scanner import HostScanOutcome, HostScanStatus
 from app.storage.local_filesystem import LocalFilesystemStorage
 from app.storage.scan_store import (
+    AskLimitExceededError,
     CertificateRecord,
     ScanRecord,
     certificate_to_record,
+    delete_scan,
     generate_scan_token,
     host_outcome_to_record,
+    increment_ask_count,
     load_scan_record,
+    report_storage_key,
     save_scan_record,
     scan_storage_key,
     summarize_host_statuses,
@@ -168,3 +174,96 @@ def test_summarize_host_statuses_counts_by_status():
 
 def test_summarize_host_statuses_empty_list():
     assert summarize_host_statuses([]) == {}
+
+
+# --- M8: increment_ask_count (Section 18's per-scan lifetime /ask cap) ---
+
+
+def _saved_record(storage, token: str = "ask-token") -> ScanRecord:
+    record = ScanRecord(
+        token=token,
+        submitted_at=datetime.now(UTC),
+        host_count=1,
+        status="complete",
+        host_results=[
+            host_outcome_to_record(
+                HostScanOutcome(
+                    hostname="example.com",
+                    port=443,
+                    status=HostScanStatus.OK,
+                    certificate=_sample_certificate(),
+                )
+            )
+        ],
+    )
+    save_scan_record(storage, record)
+    return record
+
+
+def test_increment_ask_count_unknown_token_returns_none(tmp_path):
+    storage = LocalFilesystemStorage(tmp_path)
+    assert increment_ask_count(storage, "does-not-exist", limit=20) is None
+
+
+def test_increment_ask_count_increments_and_persists(tmp_path):
+    storage = LocalFilesystemStorage(tmp_path)
+    _saved_record(storage)
+
+    updated = increment_ask_count(storage, "ask-token", limit=20)
+    assert updated is not None
+    assert updated.ask_count == 1
+
+    reloaded = load_scan_record(storage, "ask-token")
+    assert reloaded is not None
+    assert reloaded.ask_count == 1
+
+
+def test_increment_ask_count_raises_once_limit_reached(tmp_path):
+    storage = LocalFilesystemStorage(tmp_path)
+    _saved_record(storage)
+
+    for _ in range(3):
+        increment_ask_count(storage, "ask-token", limit=3)
+
+    with pytest.raises(AskLimitExceededError):
+        increment_ask_count(storage, "ask-token", limit=3)
+
+    # The rejected call must not have incremented the counter past the limit.
+    reloaded = load_scan_record(storage, "ask-token")
+    assert reloaded is not None
+    assert reloaded.ask_count == 3
+
+
+def test_increment_ask_count_zero_limit_rejects_immediately(tmp_path):
+    storage = LocalFilesystemStorage(tmp_path)
+    _saved_record(storage)
+
+    with pytest.raises(AskLimitExceededError):
+        increment_ask_count(storage, "ask-token", limit=0)
+
+
+# --- M8: delete_scan (Section 21's deletion endpoint requirement) ---
+
+
+def test_delete_scan_removes_result_and_report(tmp_path):
+    storage = LocalFilesystemStorage(tmp_path)
+    _saved_record(storage, token="delete-me")
+    storage.put(report_storage_key("delete-me"), b"%PDF-fake-report-bytes")
+
+    assert delete_scan(storage, "delete-me") is True
+
+    assert storage.get(scan_storage_key("delete-me")) is None
+    assert storage.get(report_storage_key("delete-me")) is None
+
+
+def test_delete_scan_unknown_token_returns_false(tmp_path):
+    storage = LocalFilesystemStorage(tmp_path)
+    assert delete_scan(storage, "never-existed") is False
+
+
+def test_delete_scan_twice_returns_false_the_second_time(tmp_path):
+    storage = LocalFilesystemStorage(tmp_path)
+    _saved_record(storage, token="delete-twice")
+
+    assert delete_scan(storage, "delete-twice") is True
+    assert delete_scan(storage, "delete-twice") is False

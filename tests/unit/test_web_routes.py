@@ -47,6 +47,10 @@ def _sample_certificate(**overrides) -> Certificate:
 
 @pytest.fixture
 def client(tmp_path) -> Iterator[TestClient]:
+    # M8: reset the module-level rate limiter before each test — see the
+    # comment above `routes_scans.limiter`'s definition and the matching
+    # note in tests/conftest.py's own `client` fixture.
+    routes_scans.limiter.reset()
     app = create_app()
     storage = LocalFilesystemStorage(tmp_path)
     app.dependency_overrides[get_object_storage] = lambda: storage
@@ -260,6 +264,25 @@ def test_ask_shows_fallback_message_inline(client, monkeypatch):
 def test_ask_unknown_token_is_404(client):
     response = client.post("/scans/never-issued/ask", data={"question": "test?"})
     assert response.status_code == 404
+
+
+def test_ask_shows_per_scan_cap_message_inline_once_exceeded(client, monkeypatch):
+    """M8: once this scan's lifetime `/ask` cap (Section 18: 20/scan) is
+    reached, `answer_scan_question` raises `HTTPException(429)` — the web
+    UI renders that inline on the same page rather than a raw JSON 429
+    (Decision Log), so a person using the Ask box sees a normal page, not
+    an error screen."""
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/scan", data={"hosts_text": "a.com"})
+    token = submit.headers["location"].removeprefix("/scans/")
+
+    for _ in range(20):
+        response = client.post(f"/scans/{token}/ask", data={"question": "status?"})
+        assert response.status_code == 200
+
+    twenty_first = client.post(f"/scans/{token}/ask", data={"question": "status?"})
+    assert twenty_first.status_code == 429
+    assert "status?" in twenty_first.text
 
 
 # --- JSON API: PATCH /api/scans/{token}/ai-preference (M6) ---

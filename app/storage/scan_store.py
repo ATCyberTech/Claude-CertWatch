@@ -26,6 +26,13 @@ M6 adds `update_ai_preference` — the per-scan `ai_enabled` toggle's
 storage-mutation logic (Section 16/17), shared by the JSON API's PATCH
 route and the web UI's toggle form. No enforcement of the flag exists
 yet; that's M7's job once an AI layer exists to enforce it on.
+
+M8 adds `ask_count` (Section 18's "20 questions/scan" is a lifetime cap
+per scan, not a sliding time window — a persisted counter here, checked
+and incremented by `app.ai.analyst`/`app.api.routes_scans`, not slowapi's
+time-window limiter, which owns the two per-IP-hourly limits instead) and
+`delete_scan` (Section 21's "deletion endpoint removing the object-
+storage blob on request").
 """
 
 from __future__ import annotations
@@ -169,6 +176,9 @@ class ScanRecord(BaseModel):
     ai_enabled: bool = True
     requester_email: str | None = None
     host_results: list[HostResultRecord] = []
+    # Section 18's "/ask per scan: 20" is a lifetime cap on this scan, not a
+    # sliding time window — tracked here rather than in slowapi (M8).
+    ask_count: int = 0
 
 
 def scan_storage_key(token: str) -> str:
@@ -214,6 +224,49 @@ def update_ai_preference(storage: ObjectStorage, token: str, ai_enabled: bool) -
     record.ai_enabled = ai_enabled
     save_scan_record(storage, record)
     return record
+
+
+class AskLimitExceededError(Exception):
+    """Raised by `increment_ask_count` when a scan has already reached its
+    lifetime `/ask` cap (Section 18: 20 questions/scan) — the caller (M8)
+    turns this into a 429, distinct from an unknown-token 404."""
+
+
+def increment_ask_count(storage: ObjectStorage, token: str, limit: int) -> ScanRecord | None:
+    """Check-and-increment `scan.ask_count` against its lifetime `limit`
+    (Section 18), atomically from this process's point of view (read-
+    modify-write within one call, no concurrent writers in this single-
+    process dev deployment). Returns `None` for an unknown token (the
+    caller renders its own 404); raises `AskLimitExceededError` when the
+    scan has already reached `limit` — the count is not incremented past
+    it. Every accepted call counts, even one whose answer falls back to
+    the plain message, since this cap protects the endpoint itself from
+    volume, not just LLM spend.
+    """
+    record = load_scan_record(storage, token)
+    if record is None:
+        return None
+    if record.ask_count >= limit:
+        raise AskLimitExceededError(f"scan {token} has reached its limit of {limit} questions.")
+    record.ask_count += 1
+    save_scan_record(storage, record)
+    return record
+
+
+def delete_scan(storage: ObjectStorage, token: str) -> bool:
+    """Section 21: "deletion endpoint removing the object-storage blob on
+    request." Removes every key this module or `app.reports` ever writes
+    for `token` (`result.json`, the persisted `report.pdf`; the CSV export
+    is never persisted — see `report_storage_key`'s docstring — so there
+    is no CSV key to remove). Returns `True` if a scan existed to delete,
+    `False` for an already-unknown token (the caller renders its own 404
+    either way — the return value only distinguishes "deleted" from
+    "nothing was there" for logging/response-shape purposes).
+    """
+    existed = load_scan_record(storage, token) is not None
+    storage.delete(scan_storage_key(token))
+    storage.delete(report_storage_key(token))
+    return existed
 
 
 def summarize_host_statuses(host_results: list[HostResultRecord]) -> dict[str, int]:

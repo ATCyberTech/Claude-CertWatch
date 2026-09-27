@@ -244,3 +244,76 @@ new runtime dependency, `anthropic`** — no dev/test dependency was needed;
   milestone table lists rate limiting under M8, distinct from M7's
   "grounding and citation checks, AI-disabled enforcement" scope; this
   continues the same deferral pattern used for `submit_scan` since M3.
+- **`submit_scan`'s 5/hour/IP and `ask_certwatch`'s 60/hour/IP caps
+  (Section 18) are enforced via `slowapi` as fixed limit strings, not
+  read from `Settings`** (M8 implementation decision) — `slowapi`'s
+  `@limiter.limit(...)` decorators are applied once at module-import
+  time, before any per-request `Settings` exists, so they cannot consult
+  a `Depends`-resolved or test-overridden `Settings` instance the way
+  every other value in `app.api.routes_scans` does. Changing either
+  enforced number now requires a code change to `_SUBMIT_RATE_LIMIT`/
+  `_ASK_IP_RATE_LIMIT`, not just an env var — the
+  `submit_rate_limit_per_ip_per_hour`/`ask_rate_limit_per_ip_per_hour`
+  `Settings` fields remain declared for Section 24 documentation parity
+  only. The remaining `/api/scans/{token}/*` routes (status, findings,
+  the two report exports, ai-preference, and the new deletion route) get
+  a generous, explicitly-not-spec-stated `_TOKEN_ROUTE_LIMIT`
+  ("30/minute") — defense-in-depth against token brute-forcing per
+  Section 21's "Rate-limited access" control, not a number Section 18
+  itself gives.
+- **Section 18's "/ask: 20/scan" is a persisted `ScanRecord.ask_count`
+  counter, not a `slowapi` limit** (M8 implementation decision) — it's a
+  lifetime cap on one scan, not a sliding time window, so it cannot be
+  expressed as a `slowapi` rate string at all. Checked and incremented by
+  `app.storage.scan_store.increment_ask_count` inside
+  `answer_scan_question`, before any AI logic runs; every accepted call
+  counts, even one that ends up answering with the plain fallback
+  message, since the cap protects the endpoint itself from volume, not
+  just LLM spend. Unlike the two `slowapi` limits above, this fully
+  respects the existing `Settings`-injected `ask_rate_limit_per_scan`
+  value and the test suite's `dependency_overrides` convention.
+- **Rate-limiting a shared, module-level `slowapi.Limiter` requires an
+  explicit `.reset()` in every test's `client` fixture** (M8
+  implementation note, found while writing the M8 test suite) —
+  `app.api.routes_scans.limiter` is a process-wide singleton (the module
+  is imported once per test process), so its in-memory rate-limit
+  storage would otherwise accumulate across every test in a single
+  `pytest` run and eventually cause spurious 429s in unrelated tests.
+  `tests/conftest.py`'s `client` fixture and the two local `client`
+  fixtures in `tests/unit/test_routes_scans.py`/`test_web_routes.py` each
+  call `limiter.reset()` before yielding their `TestClient`.
+- **`DELETE /api/scans/{token}` is an M8 addition to Section 13's route
+  table, sourced from Section 21's independent security-requirements
+  table** (M8 implementation decision) — Section 13 itself lists no
+  deletion row, but Section 21 states "Deletion endpoint removing the
+  object-storage blob on request" as its own BUILD NOW item. Removes the
+  persisted `result.json` and `report.pdf` for a token
+  (`app.storage.scan_store.delete_scan`); the CSV export is never
+  persisted, so there is nothing to remove there. JSON-API only — Section
+  14's UI spec lists no delete affordance, so no web-UI button was added.
+- **`Referrer-Policy: no-referrer` is applied globally, via one ASGI
+  middleware in `app.main.create_app`, not per-route** (M8 implementation
+  decision) — Section 12 (BUILD NOW since M3, never actually implemented
+  until this milestone) requires it on "all token-bearing pages"; applying
+  it to every response is a strict superset that's simpler to keep correct
+  than tracking which specific paths carry a token as the route table
+  grows.
+- **Scan-token redaction in application logs is a `logging.Filter`
+  (`app.core.logging_config.RedactTokensFilter`) attached to the root
+  logger and `certwatch.ai`, not a real log-shipping pipeline** (M8
+  implementation decision) — CertWatch has no log-shipping infrastructure
+  of its own at v0 (the same "no cloud target stood up yet" framing as
+  Section 21's secret-manager requirement). This reliably covers every
+  logger CertWatch's own code writes through, but does **not** reach
+  uvicorn's own built-in access log (`uvicorn.access`), whose handler
+  wiring is controlled by uvicorn's own `dictConfig` at a point in the
+  startup sequence this application factory cannot reliably order itself
+  around. Documented, honest mitigation: run uvicorn with `--no-access-log`
+  in any environment where access-log token exposure matters, or route
+  access logs through a reverse proxy/log pipeline with its own
+  redaction — this module does not claim a guarantee it cannot keep.
+- **No new runtime dependency was needed for M8** — `slowapi` was already
+  declared (§18, since M0) and simply wired up for the first time; the
+  deletion endpoint reuses the existing `ObjectStorage.delete` (present
+  since M0); log redaction and the Referrer-Policy header use only the
+  stdlib `logging` module and Starlette's own middleware hook.
