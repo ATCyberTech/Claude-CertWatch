@@ -28,6 +28,7 @@
     .actions a { display: inline-block; margin-right: 0.75rem; padding: 0.4rem 1rem; background: #1a1a1a; color: #fff; border-radius: 4px; text-decoration: none; font-size: 0.9rem; }
     .ask-box textarea { width: 100%; box-sizing: border-box; font-family: inherit; padding: 0.5rem; }
     .notice { background: #fff8e1; color: #6b5300; border-radius: 4px; padding: 0.6rem 1rem; margin-top: 0.5rem; font-size: 0.9rem; }
+    .error { background: #fdecea; color: #7a1212; border-radius: 4px; padding: 0.6rem 1rem; margin-top: 0.5rem; font-size: 0.9rem; }
     .toggle-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
     empty { color: #777; font-style: italic; }
   </style>
@@ -108,6 +109,9 @@
       </label>
     </form>
   </div>
+  {% if ask_error %}
+  <p class="error">{{ ask_error }}</p>
+  {% endif %}
   {% if ask_question %}
   <p class="meta"><strong>Q:</strong> {{ ask_question }}</p>
   <p class="notice">{{ ask_answer }}</p>

@@ -261,6 +261,37 @@ def test_ask_shows_fallback_message_inline(client, monkeypatch):
     assert "isn&#39;t available" in ask.text or "isn't available" in ask.text
 
 
+def test_ask_with_blank_question_shows_friendly_error_not_raw_422(client, monkeypatch):
+    """Regression test (found while manually testing M8): the browser
+    never submits a *disabled* form field at all, so a request reaching
+    this route with no `question` used to fail FastAPI's own request
+    validation before the route body ran, surfacing a raw JSON 422
+    instead of a rendered page. `question` posted as an empty string (the
+    same request shape a disabled/empty textarea produces) must now
+    render this page's normal HTML with a friendly inline notice."""
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/scan", data={"hosts_text": "a.com"})
+    token = submit.headers["location"].removeprefix("/scans/")
+
+    response = client.post(f"/scans/{token}/ask", data={"question": ""})
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Enter a question before asking CertWatch." in response.text
+
+
+def test_ask_with_missing_question_field_shows_friendly_error(client, monkeypatch):
+    """Same as above, but for the field being entirely absent from the
+    POST body — exactly what a disabled `<textarea>` produces (browsers
+    never submit a disabled field at all), not just an empty value."""
+    monkeypatch.setattr(routes_scans, "scan_hosts", _fake_scan_hosts_all_ok)
+    submit = client.post("/scan", data={"hosts_text": "a.com"})
+    token = submit.headers["location"].removeprefix("/scans/")
+
+    response = client.post(f"/scans/{token}/ask", data={})
+    assert response.status_code == 422
+    assert "Enter a question before asking CertWatch." in response.text
+
+
 def test_ask_unknown_token_is_404(client):
     response = client.post("/scans/never-issued/ask", data={"question": "test?"})
     assert response.status_code == 404

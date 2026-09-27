@@ -184,6 +184,7 @@ def _build_scan_page_context(
     ask_question: str | None = None,
     ask_answer: str | None = None,
     ask_citations: list[str] | None = None,
+    ask_error: str | None = None,
 ) -> dict[str, object]:
     """Shared template context for `scan_status.html` — built once here so
     both `scan_status_page` (GET, no question yet) and `ask_certwatch_web`
@@ -214,6 +215,7 @@ def _build_scan_page_context(
         "ask_question": ask_question,
         "ask_answer": ask_answer,
         "ask_citations": ask_citations or [],
+        "ask_error": ask_error,
     }
 
 
@@ -297,7 +299,7 @@ async def toggle_ai_preference_web(
 async def ask_certwatch_web(
     request: Request,
     token: str,
-    question: str = Form(...),
+    question: str = Form(""),
     storage: ObjectStorage = Depends(get_object_storage),
     settings: Settings = Depends(get_settings),
 ) -> Response:
@@ -319,13 +321,39 @@ async def ask_certwatch_web(
     when it fires. The per-IP-hourly cap (the decorator above) is not
     caught here: an exceeded route-level limit raises `RateLimitExceeded`,
     handled globally by `app.main`'s registered handler, the same way it is
-    for every other rate-limited route in this app (Decision Log)."""
+    for every other rate-limited route in this app (Decision Log).
+
+    Fix (found while manually testing M8): `question` used to be a
+    required `Form(...)` field. The Ask box's `<textarea>`/button are both
+    rendered `disabled` when `scan.ai_enabled` is `False` (Section 14) —
+    browsers never submit a *disabled* field at all, so a submission
+    reaching this route with AI off (or any other request missing the
+    field) previously failed FastAPI's own request validation before this
+    function's body ever ran, surfacing a raw JSON 422 instead of a
+    rendered page — the one gap in this app's usual "every user-facing
+    error renders a friendly page" pattern (Decision Log). `question` now
+    defaults to `""` and a blank/whitespace-only value is handled
+    explicitly below, the same way `submit_scan_via_web` already handles
+    an empty host list."""
     loaded = _load_certificates(storage, token)
     if loaded is None:
         return _templates.TemplateResponse(
             request, "not_found.html", {"token": token}, status_code=404
         )
     record, certificates = loaded
+    if not question.strip():
+        return _templates.TemplateResponse(
+            request,
+            "scan_status.html",
+            _build_scan_page_context(
+                record,
+                certificates,
+                _DEFAULT_SORT,
+                None,
+                ask_error="Enter a question before asking CertWatch.",
+            ),
+            status_code=422,
+        )
     try:
         response = answer_scan_question(token, question, storage, settings)
     except HTTPException as exc:
